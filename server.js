@@ -23,8 +23,24 @@ app.use(express.json());
 
 const STEAL_A_BRAINROT = {
     PLACE_ID: 109983668079237,
+    UNIVERSE_ID: null,  // Will be fetched dynamically
     GAME_NAME: "Steal a Brainrot"
 };
+
+// =====================================================
+// 🔄 GET UNIVERSE ID FROM PLACE ID
+// =====================================================
+async function getUniverseId(placeId) {
+    try {
+        const response = await axios.get(`https://apis.roblox.com/universes/v1/places/${placeId}/universe`);
+        if (response.data && response.data.universeId) {
+            return response.data.universeId;
+        }
+    } catch (error) {
+        console.error('❌ Failed to get Universe ID:', error.message);
+    }
+    return null;
+}
 
 // =====================================================
 // 🌍 CONFIGURATION 5 PROXIES RÉGIONAUX
@@ -191,7 +207,7 @@ async function fetchAllServersViaProxy(region, proxyConfig) {
         while (pageCount < CONFIG.MAX_FETCH_PAGES) {
             try {
                 const response = await axios.get(
-                    `https://games.roblox.com/v1/games/${STEAL_A_BRAINROT.PLACE_ID}/servers/Public`,
+                    `https://games.roblox.com/v1/games/${STEAL_A_BRAINROT.UNIVERSE_ID}/servers/Public`,
                     {
                         params: {
                             sortOrder: 'Desc',
@@ -592,6 +608,18 @@ app.listen(PORT, async () => {
     console.log('═'.repeat(60));
     console.log(`🎮 Game: ${STEAL_A_BRAINROT.GAME_NAME}`);
     console.log(`📍 Place ID: ${STEAL_A_BRAINROT.PLACE_ID}`);
+    
+    // Get Universe ID from Place ID
+    console.log('🔍 Fetching Universe ID...');
+    STEAL_A_BRAINROT.UNIVERSE_ID = await getUniverseId(STEAL_A_BRAINROT.PLACE_ID);
+    
+    if (!STEAL_A_BRAINROT.UNIVERSE_ID) {
+        console.error('❌ Failed to get Universe ID! Using Place ID as fallback...');
+        STEAL_A_BRAINROT.UNIVERSE_ID = STEAL_A_BRAINROT.PLACE_ID;
+    } else {
+        console.log(`✅ Universe ID: ${STEAL_A_BRAINROT.UNIVERSE_ID}`);
+    }
+    
     console.log(`🚀 Server: http://localhost:${PORT}`);
     console.log(`🔑 API Key: ${process.env.API_KEY || 'xK9mP2vL8qR4wN7jT1bY6cZ3aB5dF8gH'}`);
     console.log('');
