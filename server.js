@@ -22,7 +22,7 @@ app.use(express.json());
 // =====================================================
 
 const STEAL_A_BRAINROT = {
-    PLACE_ID: 142823291,
+    PLACE_ID: 109983668079237,
     GAME_NAME: "Steal a Brainrot"
 };
 
@@ -152,6 +152,26 @@ function releaseServer(serverId, botId) {
 // 🌐 FETCH SERVEURS DEPUIS ROBLOX API
 // =====================================================
 
+// Blacklist de serveurs problématiques (restreints détectés)
+const serverBlacklist = new Set();
+const MAX_BLACKLIST_SIZE = 1000;
+
+// Ajouter un serveur à la blacklist
+function blacklistServer(serverId, reason) {
+    if (serverBlacklist.size >= MAX_BLACKLIST_SIZE) {
+        // Clear old entries if blacklist gets too big
+        const firstEntry = serverBlacklist.values().next().value;
+        serverBlacklist.delete(firstEntry);
+    }
+    serverBlacklist.add(serverId);
+    console.log(`🚫 Blacklisted server ${serverId}: ${reason}`);
+}
+
+// Vérifier si un serveur est blacklisté
+function isBlacklisted(serverId) {
+    return serverBlacklist.has(serverId);
+}
+
 async function fetchAllServersViaProxy(region, proxyConfig) {
     try {
         console.log(`\n🔄 [${region}] Starting full server fetch...`);
@@ -189,14 +209,29 @@ async function fetchAllServersViaProxy(region, proxyConfig) {
                 if (response.data && response.data.data) {
                     const servers = response.data.data
                         .filter(server => {
-                            // Filter out private/restricted servers
-                            if (server.isRestricted || server.privateServerId) {
+                            // 1. Skip blacklisted servers
+                            if (isBlacklisted(server.id)) {
                                 return false;
                             }
-                            // Filter out full servers
+                            
+                            // 2. Skip FULL servers ONLY (8/8 players)
                             if (server.playing >= server.maxPlayers) {
                                 return false;
                             }
+                            
+                            // 3. KEEP almost full servers! (7/8, 6/8, etc. - bots can still join!)
+                            
+                            // 4. Skip completely empty servers (might be broken)
+                            // But keep servers with 1-7 players
+                            if (server.playing === 0) {
+                                return false;  // Empty servers might be stuck/broken
+                            }
+                            
+                            // 5. Skip servers with very high ping (might be unstable)
+                            if (server.ping && server.ping > 500) {
+                                return false;
+                            }
+                            
                             return true;
                         })
                         .map(server => ({
@@ -413,7 +448,7 @@ function handleJobAssignment(bot_id, vps_id, res) {
 
 app.post('/api/v1/release-server', verifyApiKey, (req, res) => {
     try {
-        const { bot_id, job_id } = req.body;
+        const { bot_id, job_id, reason } = req.body;
         
         if (!bot_id || !job_id) {
             return res.status(400).json({ 
@@ -421,13 +456,19 @@ app.post('/api/v1/release-server', verifyApiKey, (req, res) => {
             });
         }
         
+        // If reason indicates a problem, blacklist the server
+        if (reason === 'restricted' || reason === 'timeout' || reason === 'failed') {
+            blacklistServer(job_id, reason);
+        }
+        
         const released = releaseServer(job_id, bot_id);
         
         if (released) {
-            console.log(`🔓 [${bot_id}] Released ${job_id} → cooldown 5min`);
+            console.log(`🔓 [${bot_id}] Released ${job_id} → cooldown 5min ${reason ? `(${reason})` : ''}`);
             res.json({ 
                 success: true,
-                message: 'Server released and in cooldown'
+                message: 'Server released and in cooldown',
+                blacklisted: reason ? true : false
             });
         } else {
             res.json({ 
@@ -438,6 +479,30 @@ app.post('/api/v1/release-server', verifyApiKey, (req, res) => {
         
     } catch (error) {
         console.error('❌ Error in release-server:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// NEW: Report restricted/problematic server endpoint
+app.post('/api/v1/report-restricted', verifyApiKey, (req, res) => {
+    try {
+        const { bot_id, job_id, reason } = req.body;
+        
+        if (!bot_id || !job_id) {
+            return res.status(400).json({ error: 'Missing bot_id or job_id' });
+        }
+        
+        blacklistServer(job_id, reason || 'restricted');
+        console.log(`⚠️ [REPORT] ${bot_id} reported ${job_id} as ${reason || 'restricted'}`);
+        
+        res.json({ 
+            success: true,
+            message: 'Server blacklisted',
+            total_blacklisted: serverBlacklist.size
+        });
+        
+    } catch (error) {
+        console.error('❌ Error in report-restricted:', error);
         res.status(500).json({ error: 'Internal server error' });
     }
 });
