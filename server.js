@@ -8,8 +8,7 @@
 
 const express = require('express');
 const cors = require('cors');
-const axios = require('axios');
-const { HttpsProxyAgent } = require('https-proxy-agent');
+const request = require('request');  // Better proxy support than axios
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -209,32 +208,43 @@ async function fetchAllServersViaProxy(region, proxyConfig) {
             return [];
         }
         
-        // Use simple URL format for SmartProxy compatibility
-        const proxyAgent = new HttpsProxyAgent(proxyConfig.proxy_url);
         let allServers = [];
         let cursor = null;
         let pageCount = 0;
         
         while (pageCount < CONFIG.MAX_FETCH_PAGES) {
             try {
-                const response = await axios.get(
-                    `https://games.roblox.com/v1/games/${STEAL_A_BRAINROT.UNIVERSE_ID}/servers/Public`,
-                    {
-                        params: {
-                            sortOrder: 'Desc',
-                            limit: 100,
-                            cursor: cursor
-                        },
-                        httpsAgent: proxyAgent,
+                let url = `https://games.roblox.com/v1/games/${STEAL_A_BRAINROT.UNIVERSE_ID}/servers/Public?sortOrder=Desc&limit=100`;
+                if (cursor) {
+                    url += `&cursor=${encodeURIComponent(cursor)}`;
+                }
+                
+                console.log(`   🌐 Calling: ${url}`);
+                
+                // Use request with promise wrapper
+                const response = await new Promise((resolve, reject) => {
+                    request({
+                        url: url,
+                        method: 'GET',
+                        proxy: proxyConfig.proxy_url,
                         timeout: 15000,
                         headers: {
                             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                        },
+                        json: true
+                    }, (error, response, body) => {
+                        if (error) {
+                            reject(error);
+                        } else if (response.statusCode !== 200) {
+                            reject(new Error(`Status ${response.statusCode}: ${JSON.stringify(body)}`));
+                        } else {
+                            resolve(body);
                         }
-                    }
-                );
+                    });
+                });
                 
-                if (response.data && response.data.data) {
-                    const servers = response.data.data
+                if (response && response.data) {
+                    const servers = response.data
                         .filter(server => {
                             // 1. Skip blacklisted servers
                             if (isBlacklisted(server.id)) {
@@ -271,7 +281,7 @@ async function fetchAllServersViaProxy(region, proxyConfig) {
                         }));
                     
                     allServers = allServers.concat(servers);
-                    cursor = response.data.nextPageCursor;
+                    cursor = response.nextPageCursor;
                     pageCount++;
                     
                     console.log(`   📄 Page ${pageCount}: +${servers.length} servers (total: ${allServers.length})`);
@@ -287,6 +297,10 @@ async function fetchAllServersViaProxy(region, proxyConfig) {
                 }
             } catch (pageError) {
                 console.error(`   ⚠️ Error on page ${pageCount + 1}:`, pageError.message);
+                if (pageError.response) {
+                    console.error(`   📊 Status: ${pageError.response.status}`);
+                    console.error(`   📄 Response:`, JSON.stringify(pageError.response.data));
+                }
                 break;
             }
         }
