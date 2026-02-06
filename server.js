@@ -200,13 +200,8 @@ function isBlacklisted(serverId) {
 
 async function fetchAllServersViaProxy(region, proxyConfig) {
     try {
-        console.log(`\n🔄 [${region}] Starting full server fetch...`);
+        console.log(`\n🔄 [${region}] Starting full server fetch (direct, no proxy)...`);
         const startTime = Date.now();
-        
-        if (!proxyConfig.proxy_url) {
-            console.error(`❌ [${region}] No proxy URL configured!`);
-            return [];
-        }
         
         let allServers = [];
         let cursor = null;
@@ -214,19 +209,18 @@ async function fetchAllServersViaProxy(region, proxyConfig) {
         
         while (pageCount < CONFIG.MAX_FETCH_PAGES) {
             try {
-                let url = `https://games.roblox.com/v1/games/${STEAL_A_BRAINROT.UNIVERSE_ID}/servers/Public?sortOrder=Desc&limit=100`;
+                let url = `https://games.roblox.com/v1/games/${STEAL_A_BRAINROT.PLACE_ID}/servers/Public?sortOrder=Desc&limit=100`;
                 if (cursor) {
                     url += `&cursor=${encodeURIComponent(cursor)}`;
                 }
                 
                 console.log(`   🌐 Calling: ${url}`);
                 
-                // Use request with promise wrapper
+                // Direct request WITHOUT proxy
                 const response = await new Promise((resolve, reject) => {
                     request({
                         url: url,
                         method: 'GET',
-                        proxy: proxyConfig.proxy_url,
                         timeout: 15000,
                         headers: {
                             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
