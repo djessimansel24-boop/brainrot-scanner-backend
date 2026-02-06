@@ -305,6 +305,35 @@ app.post('/api/v1/get-job-assignment', verifyApiKey, (req, res) => {
             });
         }
         
+        handleJobAssignment(bot_id, vps_id, res);
+    } catch (error) {
+        console.error('❌ Error in get-job-assignment (POST):', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// GET endpoint for Roblox HttpService compatibility
+app.get('/api/v1/get-job-assignment', verifyApiKey, (req, res) => {
+    try {
+        stats.total_requests++;
+        
+        const { bot_id, vps_id } = req.query;
+        
+        if (!bot_id || !vps_id) {
+            return res.status(400).json({ 
+                error: 'Missing required fields: bot_id, vps_id' 
+            });
+        }
+        
+        handleJobAssignment(bot_id, parseInt(vps_id), res);
+    } catch (error) {
+        console.error('❌ Error in get-job-assignment (GET):', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+function handleJobAssignment(bot_id, vps_id, res) {
+        
         let botRegion = null;
         for (const [region, config] of Object.entries(REGIONAL_PROXIES)) {
             if (vps_id >= config.vps_range[0] && vps_id <= config.vps_range[1]) {
@@ -368,12 +397,7 @@ app.post('/api/v1/get-job-assignment', verifyApiKey, (req, res) => {
             total_cached: cache.jobs.length,
             place_id: STEAL_A_BRAINROT.PLACE_ID
         });
-        
-    } catch (error) {
-        console.error('❌ Error in get-job-assignment:', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
+}
 
 app.post('/api/v1/release-server', verifyApiKey, (req, res) => {
     try {
