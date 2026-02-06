@@ -23,7 +23,7 @@ app.use(express.json());
 
 const STEAL_A_BRAINROT = {
     PLACE_ID: 109983668079237,
-    UNIVERSE_ID: 5564845552,  // Universe ID for Steal a Brainrot (hardcoded)
+    UNIVERSE_ID: 7709344486,  // Correct Universe ID from game.GameId
     GAME_NAME: "Steal a Brainrot"
 };
 
