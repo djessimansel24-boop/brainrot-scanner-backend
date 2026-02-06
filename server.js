@@ -200,8 +200,13 @@ function isBlacklisted(serverId) {
 
 async function fetchAllServersViaProxy(region, proxyConfig) {
     try {
-        console.log(`\n🔄 [${region}] Starting full server fetch (direct, no proxy)...`);
+        const proxyStatus = proxyConfig.proxy_url ? `via proxy ${proxyConfig.name}` : '(direct, no proxy)';
+        console.log(`\n🔄 [${region}] Starting full server fetch ${proxyStatus}...`);
         const startTime = Date.now();
+        
+        if (!proxyConfig.proxy_url) {
+            console.warn(`⚠️ [${region}] No proxy configured! Fetching directly.`);
+        }
         
         let allServers = [];
         let cursor = null;
@@ -216,9 +221,9 @@ async function fetchAllServersViaProxy(region, proxyConfig) {
                 
                 console.log(`   🌐 Calling: ${url}`);
                 
-                // Direct request WITHOUT proxy
+                // USE PROXY if configured
                 const response = await new Promise((resolve, reject) => {
-                    request({
+                    const requestOptions = {
                         url: url,
                         method: 'GET',
                         timeout: 15000,
@@ -226,7 +231,14 @@ async function fetchAllServersViaProxy(region, proxyConfig) {
                             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
                         },
                         json: true
-                    }, (error, response, body) => {
+                    };
+                    
+                    // Add proxy if configured
+                    if (proxyConfig.proxy_url) {
+                        requestOptions.proxy = proxyConfig.proxy_url;
+                    }
+                    
+                    request(requestOptions, (error, response, body) => {
                         if (error) {
                             reject(error);
                         } else if (response.statusCode !== 200) {
