@@ -23,7 +23,7 @@ app.use(express.json());
 
 const STEAL_A_BRAINROT = {
     PLACE_ID: 109983668079237,
-    UNIVERSE_ID: null,  // Will be fetched dynamically
+    UNIVERSE_ID: 5564845552,  // Universe ID for Steal a Brainrot (hardcoded)
     GAME_NAME: "Steal a Brainrot"
 };
 
@@ -32,14 +32,25 @@ const STEAL_A_BRAINROT = {
 // =====================================================
 async function getUniverseId(placeId) {
     try {
+        console.log(`🔍 Trying API: https://apis.roblox.com/universes/v1/places/${placeId}/universe`);
         const response = await axios.get(`https://apis.roblox.com/universes/v1/places/${placeId}/universe`);
+        console.log('📥 API Response:', JSON.stringify(response.data));
+        
         if (response.data && response.data.universeId) {
+            console.log(`✅ Found Universe ID: ${response.data.universeId}`);
             return response.data.universeId;
         }
     } catch (error) {
         console.error('❌ Failed to get Universe ID:', error.message);
+        if (error.response) {
+            console.error('   Response status:', error.response.status);
+            console.error('   Response data:', JSON.stringify(error.response.data));
+        }
     }
-    return null;
+    
+    // Fallback: Try using Place ID as Universe ID
+    console.log('⚠️ Trying Place ID as Universe ID (fallback)...');
+    return placeId;
 }
 
 // =====================================================
@@ -608,18 +619,7 @@ app.listen(PORT, async () => {
     console.log('═'.repeat(60));
     console.log(`🎮 Game: ${STEAL_A_BRAINROT.GAME_NAME}`);
     console.log(`📍 Place ID: ${STEAL_A_BRAINROT.PLACE_ID}`);
-    
-    // Get Universe ID from Place ID
-    console.log('🔍 Fetching Universe ID...');
-    STEAL_A_BRAINROT.UNIVERSE_ID = await getUniverseId(STEAL_A_BRAINROT.PLACE_ID);
-    
-    if (!STEAL_A_BRAINROT.UNIVERSE_ID) {
-        console.error('❌ Failed to get Universe ID! Using Place ID as fallback...');
-        STEAL_A_BRAINROT.UNIVERSE_ID = STEAL_A_BRAINROT.PLACE_ID;
-    } else {
-        console.log(`✅ Universe ID: ${STEAL_A_BRAINROT.UNIVERSE_ID}`);
-    }
-    
+    console.log(`🎯 Universe ID: ${STEAL_A_BRAINROT.UNIVERSE_ID}`);
     console.log(`🚀 Server: http://localhost:${PORT}`);
     console.log(`🔑 API Key: ${process.env.API_KEY || 'xK9mP2vL8qR4wN7jT1bY6cZ3aB5dF8gH'}`);
     console.log('');
