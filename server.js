@@ -202,11 +202,15 @@ async function fetchAllServersViaProxy(region, proxyConfig) {
     try {
         const proxyStatus = proxyConfig.proxy_url ? `via proxy ${proxyConfig.name}` : '(direct, no proxy)';
         console.log(`\n🔄 [${region}] Starting full server fetch ${proxyStatus}...`);
-        const startTime = Date.now();
         
-        if (!proxyConfig.proxy_url) {
+        // DEBUG: Show proxy configuration
+        if (proxyConfig.proxy_url) {
+            console.log(`   🔧 Proxy URL: ${proxyConfig.proxy_url.substring(0, 50)}...`);
+        } else {
             console.warn(`⚠️ [${region}] No proxy configured! Fetching directly.`);
         }
+        
+        const startTime = Date.now();
         
         let allServers = [];
         let cursor = null;
@@ -240,8 +244,11 @@ async function fetchAllServersViaProxy(region, proxyConfig) {
                     
                     request(requestOptions, (error, response, body) => {
                         if (error) {
+                            console.error(`   ❌ Request error:`, error.message);
+                            if (error.code) console.error(`   📊 Error code:`, error.code);
                             reject(error);
                         } else if (response.statusCode !== 200) {
+                            console.error(`   ❌ HTTP ${response.statusCode}`);
                             reject(new Error(`Status ${response.statusCode}: ${JSON.stringify(body)}`));
                         } else {
                             resolve(body);
