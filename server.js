@@ -162,20 +162,8 @@ async function fetchAllServersViaProxy(region, proxyConfig) {
             return [];
         }
         
-        // Parse proxy URL into config object for SmartProxy compatibility
-        // Format: http://username:password@host:port
-        const proxyMatch = proxyConfig.proxy_url.match(/^https?:\/\/([^:]+):([^@]+)@([^:]+):(\d+)/);
-        if (!proxyMatch) {
-            console.error(`❌ [${region}] Invalid proxy URL format!`);
-            return [];
-        }
-        
-        const [, username, password, host, port] = proxyMatch;
-        const proxyAgent = new HttpsProxyAgent({
-            host: host,
-            port: parseInt(port),
-            auth: `${username}:${password}`
-        });
+        // Use simple URL format for SmartProxy compatibility
+        const proxyAgent = new HttpsProxyAgent(proxyConfig.proxy_url);
         let allServers = [];
         let cursor = null;
         let pageCount = 0;
