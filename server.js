@@ -344,11 +344,14 @@ async function refreshAllRegions() {
     
     const startTime = Date.now();
     
-    const promises = Object.entries(REGIONAL_PROXIES).map(([region, config]) => 
-        refreshRegionalCache(region, config)
-    );
-    
-    await Promise.all(promises);
+    // SEQUENTIAL instead of parallel to avoid rate limiting
+    for (const [region, config] of Object.entries(REGIONAL_PROXIES)) {
+        await refreshRegionalCache(region, config);
+        
+        // Wait 5 seconds between regions to avoid rate limiting
+        console.log('⏳ Waiting 5s before next region...\n');
+        await new Promise(resolve => setTimeout(resolve, 5000));
+    }
     
     const total = Object.values(regionalJobCache)
         .reduce((sum, cache) => sum + cache.jobs.length, 0);
