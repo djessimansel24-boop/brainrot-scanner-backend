@@ -239,32 +239,6 @@ async function fetchAllServersViaProxy(region, proxyConfig) {
                 
                 if (response && response.data) {
                     const servers = response.data
-                        .filter(server => {
-                            // 1. Skip blacklisted servers
-                            if (isBlacklisted(server.id)) {
-                                return false;
-                            }
-                            
-                            // 2. Skip FULL servers ONLY (8/8 players)
-                            if (server.playing >= server.maxPlayers) {
-                                return false;
-                            }
-                            
-                            // 3. KEEP almost full servers! (7/8, 6/8, etc. - bots can still join!)
-                            
-                            // 4. Skip completely empty servers (might be broken)
-                            // But keep servers with 1-7 players
-                            if (server.playing === 0) {
-                                return false;  // Empty servers might be stuck/broken
-                            }
-                            
-                            // 5. Skip servers with very high ping (might be unstable)
-                            if (server.ping && server.ping > 500) {
-                                return false;
-                            }
-                            
-                            return true;
-                        })
                         .map(server => ({
                             id: server.id,
                             playing: server.playing,
