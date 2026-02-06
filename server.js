@@ -187,14 +187,26 @@ async function fetchAllServersViaProxy(region, proxyConfig) {
                 );
                 
                 if (response.data && response.data.data) {
-                    const servers = response.data.data.map(server => ({
-                        id: server.id,
-                        playing: server.playing,
-                        maxPlayers: server.maxPlayers,
-                        ping: server.ping || 0,
-                        region: region,
-                        fetched_at: Date.now()
-                    }));
+                    const servers = response.data.data
+                        .filter(server => {
+                            // Filter out private/restricted servers
+                            if (server.isRestricted || server.privateServerId) {
+                                return false;
+                            }
+                            // Filter out full servers
+                            if (server.playing >= server.maxPlayers) {
+                                return false;
+                            }
+                            return true;
+                        })
+                        .map(server => ({
+                            id: server.id,
+                            playing: server.playing,
+                            maxPlayers: server.maxPlayers,
+                            ping: server.ping || 0,
+                            region: region,
+                            fetched_at: Date.now()
+                        }));
                     
                     allServers = allServers.concat(servers);
                     cursor = response.data.nextPageCursor;
