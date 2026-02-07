@@ -25,7 +25,6 @@
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
-const http = require('http');
 const https = require('https');
 
 const app = express();
@@ -497,9 +496,9 @@ async function fetchAllServersParallel() {
             console.error(`🚨 WATCHDOG: Fetch stuck for ${Math.round(stuckTime/1000)}s, force resetting`);
             // v3.5 FIX #7: Watchdog cancels the stuck stream
             globalCancelFlag.cancelled = true;
-            globalCache.fetchInProgress = false;
             stats.total_watchdog_resets++;
-            await sleep(2000); // Let streams die
+            await sleep(2000); // Let streams die BEFORE releasing the lock
+            globalCache.fetchInProgress = false;
         } else {
             console.log(`⏭️ Fetch already running (${Math.round(stuckTime/1000)}s)`);
             return;
@@ -531,27 +530,25 @@ async function fetchAllServersParallel() {
             console.log(`   🔀 SEQUENTIAL MODE (1 proxy detected)`);
 
             // v3.5 FIX #6: Sequential mode now has CYCLE_TIMEOUT
-            const seqResult = await fetchWithTimeout(async () => {
-                const results = [];
-
+            // v3.5 FIX B: Shared array so partial results survive timeout
+            const partialResults = [];
+            await fetchWithTimeout(async () => {
                 console.log(`   🚀 ${proxy.label} ↓Desc (${halfPages} pages)`);
                 const descResult = await fetchChainWithProxy(proxy, halfPages, CONFIG.FETCH_PAGE_DELAY, 'Desc', cancelFlag);
-                results.push(descResult);
+                partialResults.push(descResult);
 
                 if (!cancelFlag.cancelled) {
                     // Fresh session for Asc
                     rotateOneProxy(proxy);
                     console.log(`   🚀 ${proxy.label} ↑Asc  (${halfPages} pages)`);
                     const ascResult = await fetchChainWithProxy(proxy, halfPages, CONFIG.FETCH_PAGE_DELAY, 'Asc', cancelFlag);
-                    results.push(ascResult);
+                    partialResults.push(ascResult);
                 }
 
-                return results;
+                return partialResults;
             }, cancelFlag);
 
-            if (seqResult) {
-                allResults.push(...seqResult);
-            }
+            allResults.push(...partialResults);
 
         } else if (PROXY_POOL.length > 1) {
             // Multiple proxies: parallel mode with timeout
@@ -569,6 +566,7 @@ async function fetchAllServersParallel() {
 
             console.log(`   ⏳ ${promises.length} streams running in parallel...\n`);
 
+            // v3.5 FIX B: Partial results survive timeout
             const parResult = await fetchWithTimeout(async () => {
                 return await Promise.allSettled(promises);
             }, cancelFlag);
@@ -582,24 +580,32 @@ async function fetchAllServersParallel() {
                     }
                 }
             }
+            // On timeout, promises may still resolve — collect what we can
+            if (!parResult) {
+                await sleep(3000); // Give streams time to notice cancel
+                const settled = await Promise.allSettled(promises);
+                for (const r of settled) {
+                    if (r.status === 'fulfilled' && r.value.servers.length > 0) {
+                        allResults.push(r.value);
+                    }
+                }
+            }
 
         } else {
             // No proxies: direct fetch
-            const directResult = await fetchWithTimeout(async () => {
-                const results = [];
+            const partialDirect = [];
+            await fetchWithTimeout(async () => {
                 console.log(`   🚀 DIRECT ↓Desc (${CONFIG.DIRECT_PAGES} pages)`);
-                results.push(await fetchChainWithProxy(null, CONFIG.DIRECT_PAGES, CONFIG.DIRECT_PAGE_DELAY, 'Desc', cancelFlag));
+                partialDirect.push(await fetchChainWithProxy(null, CONFIG.DIRECT_PAGES, CONFIG.DIRECT_PAGE_DELAY, 'Desc', cancelFlag));
                 
                 if (!cancelFlag.cancelled) {
                     console.log(`   🚀 DIRECT ↑Asc  (${CONFIG.DIRECT_PAGES} pages)`);
-                    results.push(await fetchChainWithProxy(null, CONFIG.DIRECT_PAGES, CONFIG.DIRECT_PAGE_DELAY, 'Asc', cancelFlag));
+                    partialDirect.push(await fetchChainWithProxy(null, CONFIG.DIRECT_PAGES, CONFIG.DIRECT_PAGE_DELAY, 'Asc', cancelFlag));
                 }
-                return results;
+                return partialDirect;
             }, cancelFlag);
 
-            if (directResult) {
-                allResults.push(...directResult);
-            }
+            allResults.push(...partialDirect);
         }
 
         // Process all results
@@ -673,7 +679,14 @@ async function fetchAllServersParallel() {
 
         stats.total_fetch_cycles++;
         for (const p of PROXY_POOL) {
-            if (perStream[p.label]) p.lastFetch = perStream[p.label];
+            // BUG C FIX: perStream keys are "US-Desc"/"US-Asc", match by label prefix
+            const proxyStreams = {};
+            for (const [key, val] of Object.entries(perStream)) {
+                if (key.startsWith(p.label)) {
+                    proxyStreams[key] = val;
+                }
+            }
+            if (Object.keys(proxyStreams).length > 0) p.lastFetch = proxyStreams;
         }
 
     } catch (e) {
