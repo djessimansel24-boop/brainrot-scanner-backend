@@ -133,8 +133,13 @@ const CONFIG = {
 };
 
 // =====================================================
-// 💾 HTTP CLIENT
+// 💾 HTTP CLIENT — https-proxy-agent pour HTTPS via proxy
 // =====================================================
+// npm install https-proxy-agent
+// Gère automatiquement: CONNECT tunnel, auth, TLS
+// =====================================================
+
+const { HttpsProxyAgent } = require('https-proxy-agent');
 
 function httpGet(url, proxyUrl = null, timeout = 12000) {
     return new Promise((resolve, reject) => {
@@ -151,22 +156,13 @@ function httpGet(url, proxyUrl = null, timeout = 12000) {
             }
         };
 
+        // Proxy support via https-proxy-agent
         if (proxyUrl) {
-            try {
-                const proxy = new URL(proxyUrl);
-                options.hostname = proxy.hostname;
-                options.port = proxy.port || 8080;
-                options.path = url;
-                if (proxy.username && proxy.password) {
-                    options.headers['Proxy-Authorization'] =
-                        'Basic ' + Buffer.from(`${proxy.username}:${proxy.password}`).toString('base64');
-                }
-            } catch (_) { /* invalid proxy, direct fallback */ }
+            options.agent = new HttpsProxyAgent(proxyUrl);
         }
 
-        const client = parsedUrl.protocol === 'https:' && !proxyUrl ? https : http;
-
-        const req = client.request(options, (res) => {
+        const client = https;
+        const req = client.request(url, options, (res) => {
             let data = '';
             res.on('data', chunk => data += chunk);
             res.on('end', () => {
@@ -177,7 +173,7 @@ function httpGet(url, proxyUrl = null, timeout = 12000) {
             });
         });
 
-        req.on('error', reject);
+        req.on('error', (err) => reject(new Error(`REQ_ERROR: ${err.message}`)));
         req.on('timeout', () => { req.destroy(); reject(new Error('TIMEOUT')); });
         req.end();
     });
