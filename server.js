@@ -427,18 +427,19 @@ function checkBotRateLimit(botId) {
 // 🌐 PARALLEL FETCH
 // =====================================================
 
-async function fetchChainWithProxy(proxy, maxPages, pageDelay) {
-    const label = proxy ? proxy.label : 'DIRECT';
+async function fetchChainWithProxy(proxy, maxPages, pageDelay, sortOrder = 'Desc') {
+    const baseLabel = proxy ? proxy.label : 'DIRECT';
+    const label = `${baseLabel}-${sortOrder}`;
     const servers = [];
     let cursor = null;
     let pageCount = 0;
     let consecutiveErrors = 0;
     let rotations = 0;
-    const MAX_ROTATIONS = 15; // Max 15 IP rotations per fetch cycle
+    const MAX_ROTATIONS = 15;
 
     while (pageCount < maxPages) {
         try {
-            let url = `https://games.roblox.com/v1/games/${STEAL_A_BRAINROT.PLACE_ID}/servers/Public?sortOrder=Desc&limit=100`;
+            let url = `https://games.roblox.com/v1/games/${STEAL_A_BRAINROT.PLACE_ID}/servers/Public?sortOrder=${sortOrder}&limit=100`;
             if (cursor) url += `&cursor=${encodeURIComponent(cursor)}`;
 
             const response = await httpGet(url, proxy?.url || null, CONFIG.FETCH_PAGE_TIMEOUT);
@@ -518,15 +519,26 @@ async function fetchAllServersParallel() {
 
     try {
         const promises = [];
+        const halfPages = Math.ceil(CONFIG.PAGES_PER_PROXY / 2);
 
         for (const proxy of PROXY_POOL) {
-            console.log(`   🚀 ${proxy.label} (${CONFIG.PAGES_PER_PROXY} pages)`);
-            promises.push(fetchChainWithProxy(proxy, CONFIG.PAGES_PER_PROXY, CONFIG.FETCH_PAGE_DELAY));
+            // Desc = serveurs les plus remplis d'abord
+            console.log(`   🚀 ${proxy.label} ↓Desc (${halfPages} pages)`);
+            promises.push(fetchChainWithProxy(proxy, halfPages, CONFIG.FETCH_PAGE_DELAY, 'Desc'));
+            
+            // Asc = serveurs les moins remplis d'abord (différente partie de la liste)
+            // Utilise un clone du proxy pour éviter les conflits de session
+            const proxyClone = { ...proxy, url: proxy.baseUrl };
+            rotateOneProxy(proxyClone);
+            console.log(`   🚀 ${proxy.label} ↑Asc  (${halfPages} pages)`);
+            promises.push(fetchChainWithProxy(proxyClone, halfPages, CONFIG.FETCH_PAGE_DELAY, 'Asc'));
         }
 
         if (PROXY_POOL.length === 0) {
-            console.log(`   🚀 DIRECT (${CONFIG.DIRECT_PAGES} pages)`);
-            promises.push(fetchChainWithProxy(null, CONFIG.DIRECT_PAGES, CONFIG.DIRECT_PAGE_DELAY));
+            console.log(`   🚀 DIRECT ↓Desc (${CONFIG.DIRECT_PAGES} pages)`);
+            promises.push(fetchChainWithProxy(null, CONFIG.DIRECT_PAGES, CONFIG.DIRECT_PAGE_DELAY, 'Desc'));
+            console.log(`   🚀 DIRECT ↑Asc  (${CONFIG.DIRECT_PAGES} pages)`);
+            promises.push(fetchChainWithProxy(null, CONFIG.DIRECT_PAGES, CONFIG.DIRECT_PAGE_DELAY, 'Asc'));
         }
 
         console.log(`   ⏳ ${promises.length} streams running...\n`);
@@ -968,8 +980,8 @@ app.listen(PORT, async () => {
     console.log(`   7. Lock cost: <1ms × ${totalBots} bots / 5s = ${Math.ceil(totalBots / 5)}ms/s (${((totalBots / 5) / 10).toFixed(1)}% CPU)`);
 
     console.log('\n⚡ FETCH:');
-    console.log(`   🌐 ${PROXY_POOL.length || 1} parallel streams`);
-    console.log(`   📄 ${CONFIG.PAGES_PER_PROXY} pages/proxy`);
+    console.log(`   🌐 ${PROXY_POOL.length || 1} proxies × 2 sort orders (Desc+Asc)`);
+    console.log(`   📄 ${CONFIG.PAGES_PER_PROXY} pages/proxy (${Math.ceil(CONFIG.PAGES_PER_PROXY/2)} per sort)`);
     console.log(`   ⏱️  ~${Math.ceil(CONFIG.PAGES_PER_PROXY * (CONFIG.FETCH_PAGE_DELAY + 400) / 1000)}s per cycle`);
     console.log(`   🔄 Every ${CONFIG.CACHE_REFRESH_INTERVAL / 1000}s`);
 
