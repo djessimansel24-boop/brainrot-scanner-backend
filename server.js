@@ -304,6 +304,7 @@ const globalCache = {
     jobs: [],
     lastUpdate: 0,
     fetchInProgress: false,
+    fetchStartedAt: 0,
     lastFetchStats: {}
 };
 
@@ -503,11 +504,19 @@ async function fetchChainWithProxy(proxy, maxPages, pageDelay, sortOrder = 'Desc
 
 async function fetchAllServersParallel() {
     if (globalCache.fetchInProgress) {
-        console.log('⏭️ Fetch already running');
-        return;
+        // WATCHDOG: if stuck for more than 5 min, force reset
+        const stuckTime = Date.now() - (globalCache.fetchStartedAt || 0);
+        if (stuckTime > 300000) {
+            console.error(`🚨 WATCHDOG: Fetch stuck for ${Math.round(stuckTime/1000)}s, force resetting`);
+            globalCache.fetchInProgress = false;
+        } else {
+            console.log('⏭️ Fetch already running');
+            return;
+        }
     }
 
     globalCache.fetchInProgress = true;
+    globalCache.fetchStartedAt = Date.now();
     const startTime = Date.now();
 
     console.log('\n' + '═'.repeat(60));
@@ -543,7 +552,22 @@ async function fetchAllServersParallel() {
 
         console.log(`   ⏳ ${promises.length} streams running...\n`);
 
-        const results = await Promise.allSettled(promises);
+        // Max 4 min for entire fetch cycle — kill if stuck
+        const CYCLE_TIMEOUT = 240000;
+        const timeoutPromise = new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('CYCLE_TIMEOUT')), CYCLE_TIMEOUT)
+        );
+
+        let results;
+        try {
+            results = await Promise.race([
+                Promise.allSettled(promises),
+                timeoutPromise
+            ]);
+        } catch (e) {
+            console.error(`   🚨 ${e.message}: fetch cycle killed after ${CYCLE_TIMEOUT/1000}s`);
+            results = [];
+        }
 
         const allServers = [];
         const perStream = {};
@@ -561,7 +585,7 @@ async function fetchAllServersParallel() {
             }
         }
 
-        // Dedup
+        // Dedup new fetch results
         const uniqueMap = new Map();
         for (const s of allServers) {
             const existing = uniqueMap.get(s.id);
@@ -569,29 +593,54 @@ async function fetchAllServersParallel() {
                 uniqueMap.set(s.id, s);
             }
         }
-        const unique = Array.from(uniqueMap.values());
-        const dupes = allServers.length - unique.length;
+        const newServers = Array.from(uniqueMap.values());
+        const dupes = allServers.length - newServers.length;
         const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
 
-        if (unique.length > 0) {
+        if (newServers.length > 0 || globalCache.jobs.length > 0) {
             const prev = globalCache.jobs.length;
-            globalCache.jobs = unique;
+            
+            // ── MERGE: keep old servers + add new ones ──
+            // Old servers stay in cache until they're stale (10 min)
+            const STALE_THRESHOLD = 600000; // 10 min
+            const now = Date.now();
+            const mergedMap = new Map();
+            
+            // Keep old servers that aren't stale
+            for (const s of globalCache.jobs) {
+                if (now - s.fetched_at < STALE_THRESHOLD) {
+                    mergedMap.set(s.id, s);
+                }
+            }
+            
+            // Add/update with new servers
+            for (const s of newServers) {
+                mergedMap.set(s.id, s);
+            }
+            
+            const merged = Array.from(mergedMap.values());
+            const expired = prev - (merged.length - newServers.length);
+            
+            globalCache.jobs = merged;
             globalCache.lastUpdate = Date.now();
             globalCache.lastFetchStats = {
-                total: unique.length, raw: allServers.length, dupes,
-                pages: totalPages, streams: perStream, duration_s: parseFloat(elapsed)
+                total: merged.length, new: newServers.length, raw: allServers.length, dupes,
+                pages: totalPages, streams: perStream, duration_s: parseFloat(elapsed),
+                kept_from_prev: merged.length - newServers.length,
+                expired_stale: Math.max(0, expired)
             };
 
             console.log('\n' + '═'.repeat(60));
-            console.log(`✅ ${allServers.length} raw → ${unique.length} unique (${dupes} dupes) in ${elapsed}s`);
+            console.log(`✅ Fetch: ${allServers.length} raw → ${newServers.length} new unique`);
+            console.log(`   📦 Cache: ${prev} old + ${newServers.length} new - stale = ${merged.length} total`);
 
             const bySource = {};
-            for (const s of unique) bySource[s.source] = (bySource[s.source] || 0) + 1;
+            for (const s of newServers) bySource[s.source] = (bySource[s.source] || 0) + 1;
             console.log('   🏆 Unique per proxy:');
             for (const [src, cnt] of Object.entries(bySource).sort((a, b) => b[1] - a[1])) {
-                console.log(`      ${src.padEnd(16)} → ${cnt} (${((cnt / unique.length) * 100).toFixed(1)}%)`);
+                console.log(`      ${src.padEnd(16)} → ${cnt} (${((cnt / newServers.length) * 100).toFixed(1)}%)`);
             }
-            console.log(`   📈 Delta: ${unique.length > prev ? '+' : ''}${unique.length - prev}`);
+            console.log(`   📈 Delta: ${merged.length > prev ? '+' : ''}${merged.length - prev}`);
             console.log('═'.repeat(60) + '\n');
         } else {
             console.warn(`⚠️ 0 servers, keeping cache (${globalCache.jobs.length})`);
@@ -866,6 +915,7 @@ app.get('/api/v1/stats', (req, res) => {
             blacklisted: serverBlacklist.size,
             age_s: globalCache.lastUpdate ? Math.floor((Date.now() - globalCache.lastUpdate) / 1000) : -1,
             fetching: globalCache.fetchInProgress,
+            fetch_running_s: globalCache.fetchInProgress ? Math.floor((Date.now() - globalCache.fetchStartedAt) / 1000) : 0,
             last_fetch: globalCache.lastFetchStats
         },
         bots: {
