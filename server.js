@@ -1,8 +1,8 @@
 // =====================================================
-// 🧠 STEAL A BRAINROT SCANNER - BACKEND v3.6
+// 🧠 STEAL A BRAINROT SCANNER - BACKEND v3.7
 // =====================================================
 //
-// v3.6 — 8-PROXY ROTATION + FAST COOLDOWN
+// v3.7 — CONTINUOUS FETCH + PROXY ROTATION + FAST COOLDOWN
 //
 // CHANGES vs v3.5:
 //   ⚡ Cooldown: 300s → 60s (servers recycle 5× faster)
@@ -127,20 +127,18 @@ function rotateProxySessions() {
 const CONFIG = {
     // ── Assignation ──
     ASSIGNMENT_DURATION: 120000,
-    COOLDOWN_DURATION: 60000,          // v3.6: 2min → 1min (servers recyclent encore plus vite)
-    AUTO_COOLDOWN_ON_EXPIRE: 60000,    // v3.6: cohérent avec COOLDOWN_DURATION
+    COOLDOWN_DURATION: 60000,          // v3.7: 2min → 1min (servers recyclent encore plus vite)
+    AUTO_COOLDOWN_ON_EXPIRE: 60000,    // v3.7: cohérent avec COOLDOWN_DURATION
     SERVERS_PER_BOT: 20,
 
     // ── Fetch ──
-    CACHE_REFRESH_INTERVAL: 180000,
-    PAGES_PER_PROXY: 80,              // 40 per sort direction
-    FETCH_PAGE_DELAY: 1500,
+    PAGES_PER_PROXY: 40,              // 20 per sort direction (smaller, faster fetches)
+    FETCH_PAGE_DELAY: 1200,
     FETCH_PAGE_TIMEOUT: 12000,
     FETCH_MAX_CONSECUTIVE_ERRORS: 4,
     FETCH_RATE_LIMIT_BACKOFF: 5000,
-
-    // ── Rotation mode (multi-proxy) ──
-    PROXIES_PER_CYCLE: 3,             // Use 3 proxies per fetch cycle (rotate through pool)
+    CONTINUOUS_FETCH_DELAY: 10000,    // 10s between each mini-fetch
+    STALE_THRESHOLD: 600000,          // Servers expire from cache after 10 min
 
     // ── Direct fetch (sans proxy) ──
     DIRECT_PAGES: 50,
@@ -156,7 +154,7 @@ const CONFIG = {
     // ── Cleanup ──
     CLEANUP_INTERVAL: 10000,
 
-    // ── v3.6: Anti-hang (from v3.4/3.5) ──
+    // ── v3.7: Anti-hang (from v3.4/3.5) ──
     CYCLE_TIMEOUT: 240000,            // 4min (back to normal, no waves)
     WATCHDOG_TIMEOUT: 300000,         // 5min
     MAX_ROTATIONS: 10,
@@ -272,10 +270,10 @@ const globalCache = {
     lastFetchStats: {}
 };
 
-// v3.6: Global cancel flag so watchdog can kill stuck streams
+// v3.7: Global cancel flag so watchdog can kill stuck streams
 let globalCancelFlag = { cancelled: false };
 
-// v3.6: Proxy rotation index — cycles through pool
+// v3.7: Proxy rotation index — cycles through pool
 let proxyRotationIndex = 0;
 
 const serverAssignments = new Map();
@@ -396,7 +394,7 @@ function checkBotRateLimit(botId) {
 }
 
 // =====================================================
-// 🌐 FETCH — v3.6 with CYCLE_TIMEOUT on ALL modes
+// 🌐 FETCH — v3.7 with CYCLE_TIMEOUT on ALL modes
 // =====================================================
 
 async function fetchChainWithProxy(proxy, maxPages, pageDelay, sortOrder, cancelFlag) {
@@ -512,221 +510,77 @@ async function fetchWithTimeout(fetchFn, cancelFlag) {
     }
 }
 
-async function fetchAllServersParallel() {
-    if (globalCache.fetchInProgress) {
-        const stuckTime = Date.now() - (globalCache.fetchStartedAt || 0);
-        if (stuckTime > CONFIG.WATCHDOG_TIMEOUT) {
-            console.error(`🚨 WATCHDOG: Fetch stuck for ${Math.round(stuckTime/1000)}s, force resetting`);
-            // FIX #7: Watchdog cancels the stuck stream
-            globalCancelFlag.cancelled = true;
-            stats.total_watchdog_resets++;
-            await sleep(2000); // Let streams die BEFORE releasing the lock
-            globalCache.fetchInProgress = false;
-        } else {
-            console.log(`⏭️ Fetch already running (${Math.round(stuckTime/1000)}s)`);
-            return;
-        }
-    }
+async function continuousFetchLoop() {
+    console.log('🔄 Starting continuous fetch loop...\n');
+    let cycleNum = 0;
 
-    globalCache.fetchInProgress = true;
-    globalCache.fetchStartedAt = Date.now();
-    const startTime = Date.now();
+    while (true) {
+        cycleNum++;
+        const proxy = PROXY_POOL[proxyRotationIndex % PROXY_POOL.length];
+        proxyRotationIndex = (proxyRotationIndex + 1) % PROXY_POOL.length;
 
-    // v3.6: Fresh cancel flag for this cycle, stored globally for watchdog access
-    const cancelFlag = { cancelled: false };
-    globalCancelFlag = cancelFlag;
+        // Fresh session for this proxy
+        rotateOneProxy(proxy);
 
-    console.log('\n' + '═'.repeat(60));
-    console.log('🌐 FETCH CYCLE START');
-    console.log('═'.repeat(60));
+        const cancelFlag = { cancelled: false };
+        globalCancelFlag = cancelFlag;
+        const startTime = Date.now();
 
-    rotateProxySessions();
-
-    try {
-        const allResults = [];
+        // Alternate between Desc and Asc each cycle
+        const sortOrder = cycleNum % 2 === 0 ? 'Asc' : 'Desc';
         const halfPages = Math.ceil(CONFIG.PAGES_PER_PROXY / 2);
 
-        // v3.6: ALL modes wrapped in CYCLE_TIMEOUT via fetchWithTimeout
+        try {
+            const result = await fetchChainWithProxy(proxy, halfPages, CONFIG.FETCH_PAGE_DELAY, sortOrder, cancelFlag);
+            
+            if (result.servers.length > 0) {
+                // Merge into cache
+                const now = Date.now();
+                const mergedMap = new Map();
 
-        if (PROXY_POOL.length === 1) {
-            const proxy = PROXY_POOL[0];
-            console.log(`   🔀 SEQUENTIAL MODE (1 proxy detected)`);
-
-            // FIX #6: Sequential mode now has CYCLE_TIMEOUT
-            // FIX B: Shared array so partial results survive timeout
-            const partialResults = [];
-            await fetchWithTimeout(async () => {
-                console.log(`   🚀 ${proxy.label} ↓Desc (${halfPages} pages)`);
-                const descResult = await fetchChainWithProxy(proxy, halfPages, CONFIG.FETCH_PAGE_DELAY, 'Desc', cancelFlag);
-                partialResults.push(descResult);
-
-                if (!cancelFlag.cancelled) {
-                    // Fresh session for Asc
-                    rotateOneProxy(proxy);
-                    console.log(`   🚀 ${proxy.label} ↑Asc  (${halfPages} pages)`);
-                    const ascResult = await fetchChainWithProxy(proxy, halfPages, CONFIG.FETCH_PAGE_DELAY, 'Asc', cancelFlag);
-                    partialResults.push(ascResult);
-                }
-
-                return partialResults;
-            }, cancelFlag);
-
-            allResults.push(...partialResults);
-
-        } else if (PROXY_POOL.length > 1) {
-            // v3.6: ROTATION MODE — pick N proxies from the pool, rotate each cycle
-            const n = Math.min(CONFIG.PROXIES_PER_CYCLE, PROXY_POOL.length);
-            const selected = [];
-            for (let i = 0; i < n; i++) {
-                selected.push(PROXY_POOL[(proxyRotationIndex + i) % PROXY_POOL.length]);
-            }
-            proxyRotationIndex = (proxyRotationIndex + n) % PROXY_POOL.length;
-
-            console.log(`   🔄 ROTATION: using ${selected.map(p => p.label).join(' + ')} (${n}/${PROXY_POOL.length})`);
-
-            const promises = [];
-            for (const proxy of selected) {
-                console.log(`   🚀 ${proxy.label} ↓Desc (${halfPages} pages)`);
-                promises.push(fetchChainWithProxy(proxy, halfPages, CONFIG.FETCH_PAGE_DELAY, 'Desc', cancelFlag));
-
-                const proxyClone = { ...proxy, url: proxy.baseUrl, errors: 0 };
-                rotateOneProxy(proxyClone);
-                console.log(`   🚀 ${proxy.label} ↑Asc  (${halfPages} pages)`);
-                promises.push(fetchChainWithProxy(proxyClone, halfPages, CONFIG.FETCH_PAGE_DELAY, 'Asc', cancelFlag));
-            }
-
-            console.log(`   ⏳ ${promises.length} streams running in parallel...\n`);
-
-            const partialResults = [];
-            const parResult = await fetchWithTimeout(async () => {
-                return await Promise.allSettled(promises);
-            }, cancelFlag);
-
-            if (parResult) {
-                for (const r of parResult) {
-                    if (r.status === 'fulfilled') {
-                        partialResults.push(r.value);
-                    } else {
-                        console.error(`   ❌ Stream failed: ${r.reason?.message}`);
+                // Keep non-stale existing servers
+                for (const s of globalCache.jobs) {
+                    if (now - s.fetched_at < CONFIG.STALE_THRESHOLD) {
+                        mergedMap.set(s.id, s);
                     }
                 }
-            }
-            if (!parResult) {
-                await sleep(3000);
-                const settled = await Promise.allSettled(promises);
-                for (const r of settled) {
-                    if (r.status === 'fulfilled' && r.value.servers.length > 0) {
-                        partialResults.push(r.value);
-                    }
-                }
-            }
 
-            allResults.push(...partialResults);
-
-        } else {
-            // No proxies: direct fetch
-            const partialDirect = [];
-            await fetchWithTimeout(async () => {
-                console.log(`   🚀 DIRECT ↓Desc (${CONFIG.DIRECT_PAGES} pages)`);
-                partialDirect.push(await fetchChainWithProxy(null, CONFIG.DIRECT_PAGES, CONFIG.DIRECT_PAGE_DELAY, 'Desc', cancelFlag));
-                
-                if (!cancelFlag.cancelled) {
-                    console.log(`   🚀 DIRECT ↑Asc  (${CONFIG.DIRECT_PAGES} pages)`);
-                    partialDirect.push(await fetchChainWithProxy(null, CONFIG.DIRECT_PAGES, CONFIG.DIRECT_PAGE_DELAY, 'Asc', cancelFlag));
-                }
-                return partialDirect;
-            }, cancelFlag);
-
-            allResults.push(...partialDirect);
-        }
-
-        // Process all results
-        const allServers = [];
-        const perStream = {};
-        let totalPages = 0;
-
-        for (const { label, servers, pages } of allResults) {
-            allServers.push(...servers);
-            totalPages += pages;
-            perStream[label] = { servers: servers.length, pages };
-            console.log(`   ✅ [${label}] ${servers.length} servers (${pages} pages)`);
-        }
-
-        // Dedup
-        const uniqueMap = new Map();
-        for (const s of allServers) {
-            const existing = uniqueMap.get(s.id);
-            if (!existing || s.fetched_at > existing.fetched_at) {
-                uniqueMap.set(s.id, s);
-            }
-        }
-        const newServers = Array.from(uniqueMap.values());
-        const dupes = allServers.length - newServers.length;
-        const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-
-        if (newServers.length > 0 || globalCache.jobs.length > 0) {
-            const prev = globalCache.jobs.length;
-
-            const STALE_THRESHOLD = 600000;
-            const now = Date.now();
-            const mergedMap = new Map();
-
-            for (const s of globalCache.jobs) {
-                if (now - s.fetched_at < STALE_THRESHOLD) {
+                // Add new servers
+                let newCount = 0;
+                for (const s of result.servers) {
+                    if (!mergedMap.has(s.id)) newCount++;
                     mergedMap.set(s.id, s);
                 }
+
+                const prevSize = globalCache.jobs.length;
+                globalCache.jobs = Array.from(mergedMap.values());
+                globalCache.lastUpdate = now;
+
+                const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+                console.log(`   ✅ #${cycleNum} [${proxy.label}/${sortOrder}] ${result.servers.length} fetched, +${newCount} new → Cache: ${globalCache.jobs.length} (${elapsed}s)`);
+
+                stats.total_fetch_cycles++;
+            } else {
+                const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+                console.log(`   ⚪ #${cycleNum} [${proxy.label}/${sortOrder}] 0 servers (${elapsed}s)`);
             }
 
-            for (const s of newServers) {
-                mergedMap.set(s.id, s);
-            }
-
-            const merged = Array.from(mergedMap.values());
-            const expired = prev - (merged.length - newServers.length);
-
-            globalCache.jobs = merged;
-            globalCache.lastUpdate = Date.now();
-            globalCache.lastFetchStats = {
-                total: merged.length, new: newServers.length, raw: allServers.length, dupes,
-                pages: totalPages, streams: perStream, duration_s: parseFloat(elapsed),
-                kept_from_prev: merged.length - newServers.length,
-                expired_stale: Math.max(0, expired)
-            };
-
-            console.log('\n' + '═'.repeat(60));
-            console.log(`✅ Fetch: ${allServers.length} raw → ${newServers.length} new unique (${elapsed}s)`);
-            console.log(`   📦 Cache: ${prev} old + ${newServers.length} new - stale = ${merged.length} total`);
-
-            const bySource = {};
-            for (const s of newServers) bySource[s.source] = (bySource[s.source] || 0) + 1;
-            console.log('   🏆 Unique per stream:');
-            for (const [src, cnt] of Object.entries(bySource).sort((a, b) => b[1] - a[1])) {
-                console.log(`      ${src.padEnd(16)} → ${cnt} (${((cnt / newServers.length) * 100).toFixed(1)}%)`);
-            }
-            console.log(`   📈 Delta: ${merged.length > prev ? '+' : ''}${merged.length - prev}`);
-            console.log('═'.repeat(60) + '\n');
-        } else {
-            console.warn(`⚠️ 0 servers, keeping cache (${globalCache.jobs.length})`);
+        } catch (e) {
+            console.error(`   ❌ #${cycleNum} [${proxy.label}/${sortOrder}] Error: ${e.message}`);
         }
 
-        stats.total_fetch_cycles++;
-        for (const p of PROXY_POOL) {
-            // BUG C FIX: perStream keys are "US-Desc"/"US-Asc", match by label prefix
-            const proxyStreams = {};
-            for (const [key, val] of Object.entries(perStream)) {
-                if (key.startsWith(p.label)) {
-                    proxyStreams[key] = val;
-                }
-            }
-            if (Object.keys(proxyStreams).length > 0) p.lastFetch = proxyStreams;
+        // Purge stale servers periodically
+        if (cycleNum % 10 === 0) {
+            const now = Date.now();
+            const before = globalCache.jobs.length;
+            globalCache.jobs = globalCache.jobs.filter(s => now - s.fetched_at < CONFIG.STALE_THRESHOLD);
+            const purged = before - globalCache.jobs.length;
+            if (purged > 0) console.log(`   🧹 Purged ${purged} stale servers → Cache: ${globalCache.jobs.length}`);
         }
 
-    } catch (e) {
-        console.error(`❌ Fatal fetch error: ${e.message}`);
-        console.error(e.stack);
+        // Wait before next fetch
+        await sleep(CONFIG.CONTINUOUS_FETCH_DELAY);
     }
-
-    globalCache.fetchInProgress = false;
 }
 
 // =====================================================
@@ -927,9 +781,7 @@ app.post('/api/v1/clear-history', verifyApiKey, (req, res) => {
 });
 
 app.post('/api/v1/force-refresh', verifyApiKey, (req, res) => {
-    if (globalCache.fetchInProgress) return res.json({ success: false, message: 'Already running' });
-    res.json({ success: true, message: 'Started' });
-    fetchAllServersParallel();
+    res.json({ success: true, message: 'Continuous mode — always fetching', cache_size: globalCache.jobs.length });
 });
 
 app.get('/api/v1/stats', (req, res) => {
@@ -937,7 +789,7 @@ app.get('/api/v1/stats', (req, res) => {
 
     res.json({
         game: STEAL_A_BRAINROT,
-        version: '3.6',
+        version: '3.7',
         cache: {
             total: globalCache.jobs.length,
             available: avail,
@@ -974,11 +826,8 @@ app.get('/api/v1/stats', (req, res) => {
             cooldown_s: CONFIG.COOLDOWN_DURATION / 1000,
             servers_per_bot: CONFIG.SERVERS_PER_BOT,
             pages_per_proxy: CONFIG.PAGES_PER_PROXY,
-            refresh_s: CONFIG.CACHE_REFRESH_INTERVAL / 1000,
-            cycle_timeout_s: CONFIG.CYCLE_TIMEOUT / 1000,
-            watchdog_s: CONFIG.WATCHDOG_TIMEOUT / 1000,
-            max_rotations: CONFIG.MAX_ROTATIONS,
-            proxies_per_cycle: CONFIG.PROXIES_PER_CYCLE,
+            continuous_delay_s: CONFIG.CONTINUOUS_FETCH_DELAY / 1000,
+            stale_threshold_s: CONFIG.STALE_THRESHOLD / 1000,
             proxy_pool_size: PROXY_POOL.length
         }
     });
@@ -986,7 +835,7 @@ app.get('/api/v1/stats', (req, res) => {
 
 app.get('/health', (req, res) => {
     res.json({
-        status: 'ok', version: '3.6',
+        status: 'ok', version: '3.7',
         servers: globalCache.jobs.length,
         uptime: Math.floor(process.uptime()),
         collisions_ever: stats.total_collisions_detected,
@@ -1039,14 +888,14 @@ setInterval(() => {
 }, 1800000);
 
 // =====================================================
-// 🚀 STARTUP — v3.6
+// 🚀 STARTUP — v3.7
 // =====================================================
 
 app.listen(PORT, () => {
     console.clear();
     console.log('\n' + '═'.repeat(60));
-    console.log('🧠 STEAL A BRAINROT SCANNER - BACKEND v3.6');
-    console.log('   🔒 ZERO COLLISION + PROXY ROTATION + FAST COOLDOWN');
+    console.log('🧠 STEAL A BRAINROT SCANNER - BACKEND v3.7');
+    console.log('   🔒 ZERO COLLISION + CONTINUOUS FETCH + FAST COOLDOWN');
     console.log('═'.repeat(60));
     console.log(`🎮 ${STEAL_A_BRAINROT.GAME_NAME}`);
     console.log(`📍 Place ID: ${STEAL_A_BRAINROT.PLACE_ID}`);
@@ -1062,23 +911,18 @@ app.listen(PORT, () => {
     console.log('   Global lock + SHA-256 + history + safety net');
     console.log(`   Lock cost: ${Math.ceil(totalBots / 5)}ms/s (${((totalBots / 5) / 10).toFixed(1)}% CPU)`);
 
-    console.log('\n🛡️ ANTI-HANG (v3.6):');
-    console.log(`   1. setInterval BEFORE initial fetch`);
-    console.log(`   2. CYCLE_TIMEOUT: ${CONFIG.CYCLE_TIMEOUT/1000}s (ALL modes — sequential + parallel)`);
-    console.log(`   3. Stream cancellation (instant stop on timeout)`);
-    console.log(`   4. Sequential mode with 1 proxy`);
-    console.log(`   5. Max ${CONFIG.MAX_ROTATIONS} rotations, no reset after ${CONFIG.ROTATION_NORESET_AFTER}`);
-    console.log(`   6. Watchdog: ${CONFIG.WATCHDOG_TIMEOUT/1000}s (kills stuck streams via cancelFlag)`);
+    console.log('\n🛡️ SAFETY (v3.7):');
+    console.log(`   1. Continuous fetch loop (never hangs)`);
+    console.log(`   2. Max ${CONFIG.MAX_ROTATIONS} rotations per fetch`);
+    console.log(`   3. ${CONFIG.FETCH_MAX_CONSECUTIVE_ERRORS} max consecutive errors → skip`);
+    console.log(`   4. Stale purge every 10 cycles`);
 
     console.log('\n⚡ FETCH:');
     console.log(`   🌐 ${PROXY_POOL.length || 1} proxies in pool`);
     console.log(`   📄 ${CONFIG.PAGES_PER_PROXY} pages/proxy (${Math.ceil(CONFIG.PAGES_PER_PROXY/2)} per sort)`);
-    if (PROXY_POOL.length > 1) {
-        console.log(`   🔄 ROTATION: ${CONFIG.PROXIES_PER_CYCLE} proxies/cycle (${CONFIG.PROXIES_PER_CYCLE * 2} streams), rotating through ${PROXY_POOL.length}`);
-    } else {
-        console.log(`   ${PROXY_POOL.length === 1 ? '🔀 SEQUENTIAL mode (1 proxy)' : '⚡ DIRECT mode'}`);
-    }
-    console.log(`   🔄 Every ${CONFIG.CACHE_REFRESH_INTERVAL / 1000}s`);
+    console.log(`   🔄 CONTINUOUS mode: 1 proxy/fetch, rotating through ${PROXY_POOL.length}`);
+    console.log(`   ⏱️ ${CONFIG.CONTINUOUS_FETCH_DELAY / 1000}s between fetches`);
+    console.log(`   🗑️ Stale after ${CONFIG.STALE_THRESHOLD / 60000} min`);
 
     console.log('\n📊 CAPACITY:');
     console.log(`   🤖 ${totalBots} bots × ${CONFIG.SERVERS_PER_BOT} = ${(totalBots * CONFIG.SERVERS_PER_BOT).toLocaleString()} servers/cycle`);
@@ -1089,14 +933,9 @@ app.listen(PORT, () => {
     }
     console.log('═'.repeat(60) + '\n');
 
-    // v3.4 FIX #1: Start interval BEFORE initial fetch
-    setInterval(fetchAllServersParallel, CONFIG.CACHE_REFRESH_INTERVAL);
-
-    console.log('🔄 Initial fetch...\n');
-    fetchAllServersParallel().then(() => {
-        console.log('✅ Backend v3.6 ready!\n');
-    }).catch(e => {
-        console.error('❌ Initial fetch failed:', e.message);
+    // Start continuous fetch loop (never stops)
+    continuousFetchLoop().catch(e => {
+        console.error('❌ Continuous fetch loop crashed:', e.message);
     });
 });
 
