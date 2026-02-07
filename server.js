@@ -146,8 +146,8 @@ const CONFIG = {
     SERVERS_PER_BOT: 20,
 
     // ── Fetch parallèle ──
-    CACHE_REFRESH_INTERVAL: 120000,  // 2 min
-    PAGES_PER_PROXY: 50,             // 50 pages × 100 = 5,000/proxy
+    CACHE_REFRESH_INTERVAL: 180000,  // 3 min (80 pages + rotations takes ~2min)
+    PAGES_PER_PROXY: 80,             // 80 pages × 100 = 8,000/proxy
     FETCH_PAGE_DELAY: 1500,           // 1.5s entre pages (Roblox rate limit strict)
     FETCH_PAGE_TIMEOUT: 12000,
     FETCH_MAX_CONSECUTIVE_ERRORS: 4,
@@ -179,11 +179,10 @@ const { HttpsProxyAgent } = require('https-proxy-agent');
 
 function httpGet(url, proxyUrl = null, timeout = 12000) {
     return new Promise((resolve, reject) => {
-        const parsedUrl = new URL(url);
+        let settled = false;
+        const done = (fn, val) => { if (!settled) { settled = true; fn(val); } };
+
         const options = {
-            hostname: parsedUrl.hostname,
-            port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
-            path: parsedUrl.pathname + parsedUrl.search,
             method: 'GET',
             timeout,
             headers: {
@@ -194,23 +193,32 @@ function httpGet(url, proxyUrl = null, timeout = 12000) {
 
         // Proxy support via https-proxy-agent
         if (proxyUrl) {
-            options.agent = new HttpsProxyAgent(proxyUrl);
+            options.agent = new HttpsProxyAgent(proxyUrl, { timeout });
         }
 
-        const client = https;
-        const req = client.request(url, options, (res) => {
+        const req = https.request(url, options, (res) => {
             let data = '';
             res.on('data', chunk => data += chunk);
             res.on('end', () => {
-                if (res.statusCode === 429) return reject(new Error('RATE_LIMITED'));
-                if (res.statusCode !== 200) return reject(new Error(`HTTP_${res.statusCode}`));
-                try { resolve(JSON.parse(data)); }
-                catch (_) { reject(new Error('JSON_PARSE_FAIL')); }
+                if (res.statusCode === 429) return done(reject, new Error('RATE_LIMITED'));
+                if (res.statusCode !== 200) return done(reject, new Error(`HTTP_${res.statusCode}`));
+                try { done(resolve, JSON.parse(data)); }
+                catch (_) { done(reject, new Error('JSON_PARSE_FAIL')); }
             });
         });
 
-        req.on('error', (err) => reject(new Error(`REQ_ERROR: ${err.message}`)));
-        req.on('timeout', () => { req.destroy(); reject(new Error('TIMEOUT')); });
+        req.on('error', (err) => done(reject, new Error(`REQ_ERROR: ${err.message}`)));
+        req.on('timeout', () => { req.destroy(); done(reject, new Error('TIMEOUT')); });
+
+        // HARD TIMEOUT — kills hanging proxy connections that ignore socket timeout
+        const hardTimer = setTimeout(() => {
+            req.destroy();
+            done(reject, new Error('HARD_TIMEOUT'));
+        }, timeout + 3000); // 3s grace period after soft timeout
+
+        // Clear hard timer when request completes normally
+        req.on('close', () => clearTimeout(hardTimer));
+
         req.end();
     });
 }
@@ -426,7 +434,7 @@ async function fetchChainWithProxy(proxy, maxPages, pageDelay) {
     let pageCount = 0;
     let consecutiveErrors = 0;
     let rotations = 0;
-    const MAX_ROTATIONS = 5; // Max 5 IP rotations per fetch cycle
+    const MAX_ROTATIONS = 15; // Max 15 IP rotations per fetch cycle
 
     while (pageCount < maxPages) {
         try {
