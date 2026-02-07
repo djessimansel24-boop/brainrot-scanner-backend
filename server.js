@@ -132,7 +132,8 @@ const CONFIG = {
     SERVERS_PER_BOT: 20,
 
     // ── Fetch ──
-    PAGES_PER_PROXY: 40,              // 20 per sort direction (smaller, faster fetches)
+    INITIAL_PAGES_PER_PROXY: 80,      // Initial big fetch: 40 per sort (deep scan)
+    CONTINUOUS_PAGES_PER_PROXY: 20,   // Continuous loops: 10 per sort (quick refresh)
     FETCH_PAGE_DELAY: 1200,
     FETCH_PAGE_TIMEOUT: 12000,
     FETCH_MAX_CONSECUTIVE_ERRORS: 4,
@@ -510,77 +511,134 @@ async function fetchWithTimeout(fetchFn, cancelFlag) {
     }
 }
 
-async function continuousFetchLoop() {
-    console.log('🔄 Starting continuous fetch loop...\n');
-    let cycleNum = 0;
+// Merge servers into cache (thread-safe via single-threaded Node.js)
+function mergeIntoCache(newServers, label) {
+    if (newServers.length === 0) return 0;
+    
+    const now = Date.now();
+    const mergedMap = new Map();
 
+    // Keep non-stale existing servers
+    for (const s of globalCache.jobs) {
+        if (now - s.fetched_at < CONFIG.STALE_THRESHOLD) {
+            mergedMap.set(s.id, s);
+        }
+    }
+
+    // Add new servers
+    let newCount = 0;
+    for (const s of newServers) {
+        if (!mergedMap.has(s.id)) newCount++;
+        mergedMap.set(s.id, s);
+    }
+
+    globalCache.jobs = Array.from(mergedMap.values());
+    globalCache.lastUpdate = now;
+    return newCount;
+}
+
+// Single proxy continuous loop
+async function proxyFetchLoop(proxy) {
+    let cycleNum = 0;
+    
     while (true) {
         cycleNum++;
-        const proxy = PROXY_POOL[proxyRotationIndex % PROXY_POOL.length];
-        proxyRotationIndex = (proxyRotationIndex + 1) % PROXY_POOL.length;
-
-        // Fresh session for this proxy
-        rotateOneProxy(proxy);
-
-        const cancelFlag = { cancelled: false };
-        globalCancelFlag = cancelFlag;
-        const startTime = Date.now();
-
-        // Alternate between Desc and Asc each cycle
         const sortOrder = cycleNum % 2 === 0 ? 'Asc' : 'Desc';
-        const halfPages = Math.ceil(CONFIG.PAGES_PER_PROXY / 2);
+        const halfPages = Math.ceil(CONFIG.CONTINUOUS_PAGES_PER_PROXY / 2);
+        
+        // Fresh session each fetch
+        rotateOneProxy(proxy);
+        const cancelFlag = { cancelled: false };
+        const startTime = Date.now();
 
         try {
             const result = await fetchChainWithProxy(proxy, halfPages, CONFIG.FETCH_PAGE_DELAY, sortOrder, cancelFlag);
-            
+            const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+
             if (result.servers.length > 0) {
-                // Merge into cache
-                const now = Date.now();
-                const mergedMap = new Map();
-
-                // Keep non-stale existing servers
-                for (const s of globalCache.jobs) {
-                    if (now - s.fetched_at < CONFIG.STALE_THRESHOLD) {
-                        mergedMap.set(s.id, s);
-                    }
-                }
-
-                // Add new servers
-                let newCount = 0;
-                for (const s of result.servers) {
-                    if (!mergedMap.has(s.id)) newCount++;
-                    mergedMap.set(s.id, s);
-                }
-
-                const prevSize = globalCache.jobs.length;
-                globalCache.jobs = Array.from(mergedMap.values());
-                globalCache.lastUpdate = now;
-
-                const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-                console.log(`   ✅ #${cycleNum} [${proxy.label}/${sortOrder}] ${result.servers.length} fetched, +${newCount} new → Cache: ${globalCache.jobs.length} (${elapsed}s)`);
-
+                const newCount = mergeIntoCache(result.servers, `${proxy.label}/${sortOrder}`);
+                console.log(`   ✅ [${proxy.label}/${sortOrder}] ${result.servers.length} fetched, +${newCount} new → Cache: ${globalCache.jobs.length} (${elapsed}s)`);
                 stats.total_fetch_cycles++;
             } else {
-                const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-                console.log(`   ⚪ #${cycleNum} [${proxy.label}/${sortOrder}] 0 servers (${elapsed}s)`);
+                console.log(`   ⚪ [${proxy.label}/${sortOrder}] 0 servers (${elapsed}s)`);
             }
-
         } catch (e) {
-            console.error(`   ❌ #${cycleNum} [${proxy.label}/${sortOrder}] Error: ${e.message}`);
+            console.error(`   ❌ [${proxy.label}/${sortOrder}] Error: ${e.message}`);
         }
 
-        // Purge stale servers periodically
-        if (cycleNum % 10 === 0) {
-            const now = Date.now();
-            const before = globalCache.jobs.length;
-            globalCache.jobs = globalCache.jobs.filter(s => now - s.fetched_at < CONFIG.STALE_THRESHOLD);
-            const purged = before - globalCache.jobs.length;
-            if (purged > 0) console.log(`   🧹 Purged ${purged} stale servers → Cache: ${globalCache.jobs.length}`);
-        }
-
-        // Wait before next fetch
+        // Wait before next fetch (stagger to avoid all hitting at same time)
         await sleep(CONFIG.CONTINUOUS_FETCH_DELAY);
     }
+}
+
+// Initial big fetch: all proxies in parallel for fast cache fill
+async function initialBigFetch() {
+    console.log('═'.repeat(60));
+    console.log('🚀 INITIAL BIG FETCH — all proxies in parallel');
+    console.log('═'.repeat(60));
+
+    const startTime = Date.now();
+    const halfPages = Math.ceil(CONFIG.INITIAL_PAGES_PER_PROXY / 2);
+    const promises = [];
+
+    for (const proxy of PROXY_POOL) {
+        rotateOneProxy(proxy);
+        console.log(`   🚀 ${proxy.label} ↓Desc (${halfPages} pages)`);
+        promises.push(fetchChainWithProxy(proxy, halfPages, CONFIG.FETCH_PAGE_DELAY, 'Desc', { cancelled: false }));
+
+        const proxyClone = { ...proxy, url: proxy.baseUrl, errors: 0 };
+        rotateOneProxy(proxyClone);
+        console.log(`   🚀 ${proxy.label} ↑Asc  (${halfPages} pages)`);
+        promises.push(fetchChainWithProxy(proxyClone, halfPages, CONFIG.FETCH_PAGE_DELAY, 'Asc', { cancelled: false }));
+    }
+
+    console.log(`   ⏳ ${promises.length} streams...\n`);
+
+    const results = await Promise.allSettled(promises);
+    let totalRaw = 0, totalNew = 0;
+
+    for (const r of results) {
+        if (r.status === 'fulfilled' && r.value.servers.length > 0) {
+            const newCount = mergeIntoCache(r.value.servers, r.value.label);
+            totalRaw += r.value.servers.length;
+            totalNew += newCount;
+            console.log(`   ✅ [${r.value.label}] ${r.value.servers.length} servers (${r.value.pages} pages)`);
+        }
+    }
+
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log('\n' + '═'.repeat(60));
+    console.log(`✅ Initial fetch: ${totalRaw} raw → ${totalNew} unique → Cache: ${globalCache.jobs.length} (${elapsed}s)`);
+    console.log('═'.repeat(60) + '\n');
+}
+
+// Start all continuous loops
+async function startContinuousFetching() {
+    // Phase 1: Big initial fetch
+    await initialBigFetch();
+    console.log('✅ Backend v3.7 ready!\n');
+
+    // Phase 2: Start independent continuous loops (staggered start)
+    console.log('🔄 Starting continuous fetch loops...\n');
+    for (let i = 0; i < PROXY_POOL.length; i++) {
+        const proxy = PROXY_POOL[i];
+        // Stagger start: each proxy starts 2s apart to avoid thundering herd
+        setTimeout(() => {
+            console.log(`   🔁 [${proxy.label}] Continuous loop started`);
+            proxyFetchLoop(proxy).catch(e => {
+                console.error(`❌ [${proxy.label}] Loop crashed: ${e.message}`);
+            });
+        }, i * 2000);
+    }
+
+    // Stale purge timer
+    setInterval(() => {
+        const now = Date.now();
+        const before = globalCache.jobs.length;
+        globalCache.jobs = globalCache.jobs.filter(s => now - s.fetched_at < CONFIG.STALE_THRESHOLD);
+        const purged = before - globalCache.jobs.length;
+        if (purged > 0) console.log(`   🧹 Purged ${purged} stale → Cache: ${globalCache.jobs.length}`);
+    }, 60000);
 }
 
 // =====================================================
@@ -825,7 +883,8 @@ app.get('/api/v1/stats', (req, res) => {
             assignment_s: CONFIG.ASSIGNMENT_DURATION / 1000,
             cooldown_s: CONFIG.COOLDOWN_DURATION / 1000,
             servers_per_bot: CONFIG.SERVERS_PER_BOT,
-            pages_per_proxy: CONFIG.PAGES_PER_PROXY,
+            initial_pages: CONFIG.INITIAL_PAGES_PER_PROXY,
+            continuous_pages: CONFIG.CONTINUOUS_PAGES_PER_PROXY,
             continuous_delay_s: CONFIG.CONTINUOUS_FETCH_DELAY / 1000,
             stale_threshold_s: CONFIG.STALE_THRESHOLD / 1000,
             proxy_pool_size: PROXY_POOL.length
@@ -918,10 +977,9 @@ app.listen(PORT, () => {
     console.log(`   4. Stale purge every 10 cycles`);
 
     console.log('\n⚡ FETCH:');
-    console.log(`   🌐 ${PROXY_POOL.length || 1} proxies in pool`);
-    console.log(`   📄 ${CONFIG.PAGES_PER_PROXY} pages/proxy (${Math.ceil(CONFIG.PAGES_PER_PROXY/2)} per sort)`);
-    console.log(`   🔄 CONTINUOUS mode: 1 proxy/fetch, rotating through ${PROXY_POOL.length}`);
-    console.log(`   ⏱️ ${CONFIG.CONTINUOUS_FETCH_DELAY / 1000}s between fetches`);
+    console.log(`   🌐 ${PROXY_POOL.length} proxies — ALL running continuously`);
+    console.log(`   🚀 Phase 1: Big initial fetch — ${CONFIG.INITIAL_PAGES_PER_PROXY} pages/proxy (${Math.ceil(CONFIG.INITIAL_PAGES_PER_PROXY/2)} per sort)`);
+    console.log(`   🔁 Phase 2: ${PROXY_POOL.length} continuous loops — ${CONFIG.CONTINUOUS_PAGES_PER_PROXY} pages/fetch (${Math.ceil(CONFIG.CONTINUOUS_PAGES_PER_PROXY/2)} per sort, ${CONFIG.CONTINUOUS_FETCH_DELAY / 1000}s gap)`);
     console.log(`   🗑️ Stale after ${CONFIG.STALE_THRESHOLD / 60000} min`);
 
     console.log('\n📊 CAPACITY:');
@@ -933,9 +991,9 @@ app.listen(PORT, () => {
     }
     console.log('═'.repeat(60) + '\n');
 
-    // Start continuous fetch loop (never stops)
-    continuousFetchLoop().catch(e => {
-        console.error('❌ Continuous fetch loop crashed:', e.message);
+    // Start continuous fetching
+    startContinuousFetching().catch(e => {
+        console.error('❌ Startup failed:', e.message);
     });
 });
 
