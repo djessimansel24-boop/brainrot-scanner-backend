@@ -1,45 +1,36 @@
 // =====================================================
-// 🧠 STEAL A BRAINROT SCANNER - BACKEND v3.3
+// 🧠 STEAL A BRAINROT SCANNER - BACKEND v3.4
 // =====================================================
 //
-// v3.3 — TRUE ZERO COLLISION (prouvé mathématiquement)
+// v3.4 — ANTI-HANG + PERFORMANCE FIX
 //
-// CORRECTIONS vs v3.2:
-//   🔴 BUG CORRIGÉ: Lock par région → LOCK GLOBAL
-//      Les locks par région permettaient 2 bots de régions
-//      différentes d'assigner les mêmes serveurs simultanément.
-//      Le lock global rend l'opération filter→sort→assign
-//      ATOMIQUE pour tous les bots, peu importe la région.
+// CORRECTIONS vs v3.3:
+//   🔴 FIX #1: setInterval AVANT le fetch initial
+//      Avant: si le premier fetch hang → setInterval jamais démarré → watchdog mort
+//      Fix: setInterval démarre AVANT, fetch initial en parallèle
 //
-//   🔴 AJOUT: Double-vérification post-assignation
-//      Après assignation, vérifie qu'aucun serveur n'est 
-//      assigné à 2 bots. Si détecté → retire + re-tire.
+//   🔴 FIX #2: CYCLE_TIMEOUT timer cleanup
+//      Avant: timer orphelin → unhandled rejection → crash possible
+//      Fix: clearTimeout quand Promise.allSettled finit en premier
 //
-//   🔴 AJOUT: Compteur de vraies collisions dans /stats
+//   🔴 FIX #3: Cancellation flag pour streams
+//      Avant: CYCLE_TIMEOUT fire mais streams continuent en arrière-plan
+//      Fix: flag partagé, streams vérifient avant chaque page
 //
-// PREUVE MATHÉMATIQUE ZÉRO COLLISION:
-//   1. Node.js est single-threaded
-//   2. Le globalLock sérialise TOUTES les assignations
-//   3. Entre acquire() et release(), un seul bot exécute:
-//      a) Lire les serveurs disponibles
-//      b) Filtrer (available + non-blacklisté + non-historique)
-//      c) Trier avec SHA-256(serverId, botId)
-//      d) Prendre les 20 premiers
-//      e) Marquer comme assignés dans serverAssignments
-//   4. Le bot suivant voit les serveurs du step (e) comme
-//      NON-disponibles au step (a)
-//   5. Donc impossible que 2 bots reçoivent le même serveur
+//   🔴 FIX #4: Streams séquentiels avec 1 proxy
+//      Avant: 2 streams simultanés sur 1 proxy = rate limit storm
+//      Fix: Desc d'abord, puis Asc avec les pages restantes
 //
-//   Performance du lock: l'opération prend <1ms.
-//   750 bots × 1 req/5s = 150 req/s × 1ms = 150ms/s = 15% CPU.
-//   Aucun problème de contention.
+//   🔴 FIX #5: Max rotations réduit + erreurs non-reset après 7
+//      Avant: 15 rotations × reset = boucle de 5-6 min
+//      Fix: 10 rotations max, pas de reset après 7
 //
-// CONSERVÉ de v3.2:
-//   ✅ 5 proxies fetch en PARALLÈLE
-//   ✅ SHA-256 distribution unique par bot
-//   ✅ Per-bot history (no re-scans)
-//   ✅ Blacklist avec expiration
-//   ✅ Rate limiting par bot
+// CONSERVÉ de v3.3:
+//   ✅ Global lock = zero collision
+//   ✅ SHA-256 distribution
+//   ✅ Watchdog 5 min
+//   ✅ Per-bot history
+//   ✅ Blacklist + cooldowns
 // =====================================================
 
 const express = require('express');
@@ -101,16 +92,6 @@ function initProxyPool() {
 // =====================================================
 // 🔄 SMARTPROXY SESSION ROTATION
 // =====================================================
-// Smartproxy format:
-//   http://user_area-US_life-15_session-XXXXX:pass@proxy.smartproxy.net:3120
-//
-// Le session ID détermine quelle IP résidentielle tu reçois.
-// Même session = même IP pendant 15 min.
-// Nouvelle session = nouvelle IP = pas de rate limit Roblox.
-//
-// On génère un nouveau session ID À CHAQUE CYCLE DE FETCH
-// pour toujours avoir une IP fraîche.
-// =====================================================
 
 function randomSessionId() {
     return crypto.randomBytes(6).toString('hex');
@@ -140,20 +121,20 @@ function rotateProxySessions() {
 
 const CONFIG = {
     // ── Assignation ──
-    ASSIGNMENT_DURATION: 120000,     // 2 min
-    COOLDOWN_DURATION: 300000,       // 5 min après release
-    AUTO_COOLDOWN_ON_EXPIRE: 180000, // 3 min si bot ne release pas
+    ASSIGNMENT_DURATION: 120000,
+    COOLDOWN_DURATION: 300000,
+    AUTO_COOLDOWN_ON_EXPIRE: 180000,
     SERVERS_PER_BOT: 20,
 
-    // ── Fetch parallèle ──
-    CACHE_REFRESH_INTERVAL: 180000,  // 3 min (80 pages + rotations takes ~2min)
-    PAGES_PER_PROXY: 80,             // 80 pages × 100 = 8,000/proxy
-    FETCH_PAGE_DELAY: 1500,           // 1.5s entre pages (Roblox rate limit strict)
+    // ── Fetch ──
+    CACHE_REFRESH_INTERVAL: 180000,
+    PAGES_PER_PROXY: 80,
+    FETCH_PAGE_DELAY: 1500,
     FETCH_PAGE_TIMEOUT: 12000,
     FETCH_MAX_CONSECUTIVE_ERRORS: 4,
     FETCH_RATE_LIMIT_BACKOFF: 5000,
 
-    // ── Direct fetch (backup sans proxy) ──
+    // ── Direct fetch (sans proxy) ──
     DIRECT_PAGES: 50,
     DIRECT_PAGE_DELAY: 1000,
 
@@ -166,13 +147,16 @@ const CONFIG = {
 
     // ── Cleanup ──
     CLEANUP_INTERVAL: 10000,
+
+    // ── v3.4: Anti-hang ──
+    CYCLE_TIMEOUT: 240000,
+    WATCHDOG_TIMEOUT: 300000,
+    MAX_ROTATIONS: 10,
+    ROTATION_NORESET_AFTER: 7,
 };
 
 // =====================================================
-// 💾 HTTP CLIENT — https-proxy-agent pour HTTPS via proxy
-// =====================================================
-// npm install https-proxy-agent
-// Gère automatiquement: CONNECT tunnel, auth, TLS
+// 💾 HTTP CLIENT
 // =====================================================
 
 const { HttpsProxyAgent } = require('https-proxy-agent');
@@ -191,7 +175,6 @@ function httpGet(url, proxyUrl = null, timeout = 12000) {
             }
         };
 
-        // Proxy support via https-proxy-agent
         if (proxyUrl) {
             options.agent = new HttpsProxyAgent(proxyUrl, { timeout });
         }
@@ -210,15 +193,12 @@ function httpGet(url, proxyUrl = null, timeout = 12000) {
         req.on('error', (err) => done(reject, new Error(`REQ_ERROR: ${err.message}`)));
         req.on('timeout', () => { req.destroy(); done(reject, new Error('TIMEOUT')); });
 
-        // HARD TIMEOUT — kills hanging proxy connections that ignore socket timeout
         const hardTimer = setTimeout(() => {
             req.destroy();
             done(reject, new Error('HARD_TIMEOUT'));
-        }, timeout + 3000); // 3s grace period after soft timeout
+        }, timeout + 3000);
 
-        // Clear hard timer when request completes normally
         req.on('close', () => clearTimeout(hardTimer));
-
         req.end();
     });
 }
@@ -227,16 +207,6 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // =====================================================
 // 🔐 SHA-256 DISTRIBUTION
-// =====================================================
-//
-// Pour chaque paire (serverId, botId), SHA-256 produit
-// un nombre sur 48 bits (281 trillion de valeurs possibles).
-//
-// Probabilité de collision de tri entre 2 bots pour
-// 15,000 serveurs: ~15000² / 2^49 ≈ 0.0000004
-// = virtuellement impossible.
-//
-// Chaque bot obtient un ordre de serveurs UNIQUE.
 // =====================================================
 
 function deterministicHashNum(serverId, botId) {
@@ -247,21 +217,7 @@ function deterministicHashNum(serverId, botId) {
 }
 
 // =====================================================
-// 🔒 GLOBAL LOCK — LA CLÉ DU ZÉRO COLLISION
-// =====================================================
-//
-// UN SEUL lock pour TOUTES les régions.
-// Pourquoi? Parce que serverAssignments est GLOBAL.
-//
-// Si 2 bots de régions différentes tournent en parallèle,
-// ils peuvent voir les mêmes serveurs comme "available"
-// et les assigner tous les deux → COLLISION.
-//
-// Avec un lock global, c'est IMPOSSIBLE:
-// Bot A entre dans le lock → filtre → assigne → sort du lock
-// Bot B entre dans le lock → voit les assignations de A → filtre les exclut
-//
-// Coût: <1ms par requête. Même avec 150 req/s = 150ms/s de lock.
+// 🔒 GLOBAL LOCK
 // =====================================================
 
 class AsyncLock {
@@ -308,11 +264,11 @@ const globalCache = {
     lastFetchStats: {}
 };
 
-const serverAssignments = new Map();  // serverId → { bot_id, expires_at }
-const serverCooldowns = new Map();    // serverId → expires_at (timestamp)
-const serverBlacklist = new Map();    // serverId → { reason, expires_at }
-const botHistory = new Map();         // bot_id → Set<serverId>
-const botLastRequest = new Map();     // bot_id → timestamp
+const serverAssignments = new Map();
+const serverCooldowns = new Map();
+const serverBlacklist = new Map();
+const botHistory = new Map();
+const botLastRequest = new Map();
 
 const stats = {
     total_requests: 0,
@@ -322,9 +278,11 @@ const stats = {
     total_blacklist_filtered: 0,
     total_rate_limited: 0,
     total_fetch_cycles: 0,
-    // v3.3: collision tracking
-    total_collisions_detected: 0,     // Should ALWAYS be 0
+    total_collisions_detected: 0,
     total_collisions_resolved: 0,
+    total_cycle_timeouts: 0,
+    total_watchdog_resets: 0,
+    total_stream_cancels: 0,
     lock_max_queue: 0,
     uptime_start: Date.now()
 };
@@ -354,7 +312,6 @@ function isServerAvailable(id) {
     const a = serverAssignments.get(id);
     if (a) {
         if (Date.now() < a.expires_at) return false;
-        // Expired → cleanup + auto-cooldown
         serverAssignments.delete(id);
         serverCooldowns.set(id, Date.now() + CONFIG.AUTO_COOLDOWN_ON_EXPIRE);
     }
@@ -425,10 +382,10 @@ function checkBotRateLimit(botId) {
 }
 
 // =====================================================
-// 🌐 PARALLEL FETCH
+// 🌐 FETCH — v3.4 with cancellation + sequential mode
 // =====================================================
 
-async function fetchChainWithProxy(proxy, maxPages, pageDelay, sortOrder = 'Desc') {
+async function fetchChainWithProxy(proxy, maxPages, pageDelay, sortOrder, cancelFlag) {
     const baseLabel = proxy ? proxy.label : 'DIRECT';
     const label = `${baseLabel}-${sortOrder}`;
     const servers = [];
@@ -436,9 +393,15 @@ async function fetchChainWithProxy(proxy, maxPages, pageDelay, sortOrder = 'Desc
     let pageCount = 0;
     let consecutiveErrors = 0;
     let rotations = 0;
-    const MAX_ROTATIONS = 15;
 
     while (pageCount < maxPages) {
+        // v3.4 FIX #3: Check cancellation before each page
+        if (cancelFlag.cancelled) {
+            console.log(`   🛑 [${label}] Cancelled at page ${pageCount}`);
+            stats.total_stream_cancels++;
+            break;
+        }
+
         try {
             let url = `https://games.roblox.com/v1/games/${STEAL_A_BRAINROT.PLACE_ID}/servers/Public?sortOrder=${sortOrder}&limit=100`;
             if (cursor) url += `&cursor=${encodeURIComponent(cursor)}`;
@@ -472,18 +435,22 @@ async function fetchChainWithProxy(proxy, maxPages, pageDelay, sortOrder = 'Desc
                 break;
             }
         } catch (err) {
+            if (cancelFlag.cancelled) break;
+
             consecutiveErrors++;
             if (err.message === 'RATE_LIMITED') {
                 console.warn(`   🚦 [${label}] Rate limited at page ${pageCount + 1}`);
                 if (proxy) {
                     proxy.errors++;
                     proxy.lastError = Date.now();
-                    // Rotate session → get fresh IP (max 5 rotations)
-                    if (rotations < MAX_ROTATIONS) {
+                    if (rotations < CONFIG.MAX_ROTATIONS) {
                         rotateOneProxy(proxy);
                         rotations++;
-                        console.warn(`   🔄 [${label}] Rotated to new IP (${rotations}/${MAX_ROTATIONS})`);
-                        consecutiveErrors = 0; // New IP = reset error count
+                        console.warn(`   🔄 [${label}] Rotated to new IP (${rotations}/${CONFIG.MAX_ROTATIONS})`);
+                        // v3.4 FIX #5: Stop resetting errors after ROTATION_NORESET_AFTER
+                        if (rotations <= CONFIG.ROTATION_NORESET_AFTER) {
+                            consecutiveErrors = 0;
+                        }
                     }
                 }
                 await sleep(CONFIG.FETCH_RATE_LIMIT_BACKOFF);
@@ -504,13 +471,13 @@ async function fetchChainWithProxy(proxy, maxPages, pageDelay, sortOrder = 'Desc
 
 async function fetchAllServersParallel() {
     if (globalCache.fetchInProgress) {
-        // WATCHDOG: if stuck for more than 5 min, force reset
         const stuckTime = Date.now() - (globalCache.fetchStartedAt || 0);
-        if (stuckTime > 300000) {
+        if (stuckTime > CONFIG.WATCHDOG_TIMEOUT) {
             console.error(`🚨 WATCHDOG: Fetch stuck for ${Math.round(stuckTime/1000)}s, force resetting`);
             globalCache.fetchInProgress = false;
+            stats.total_watchdog_resets++;
         } else {
-            console.log('⏭️ Fetch already running');
+            console.log(`⏭️ Fetch already running (${Math.round(stuckTime/1000)}s)`);
             return;
         }
     }
@@ -519,73 +486,107 @@ async function fetchAllServersParallel() {
     globalCache.fetchStartedAt = Date.now();
     const startTime = Date.now();
 
+    // v3.4 FIX #3: Shared cancellation flag
+    const cancelFlag = { cancelled: false };
+
     console.log('\n' + '═'.repeat(60));
-    console.log('🌐 PARALLEL FETCH — All proxies simultaneously');
+    console.log('🌐 FETCH CYCLE START');
     console.log('═'.repeat(60));
 
-    // Rotate proxy sessions → fresh IP for each cycle
     rotateProxySessions();
 
     try {
-        const promises = [];
+        const allResults = [];
         const halfPages = Math.ceil(CONFIG.PAGES_PER_PROXY / 2);
 
-        for (const proxy of PROXY_POOL) {
-            // Desc = serveurs les plus remplis d'abord
+        // v3.4 FIX #4: Sequential mode with 1 proxy
+        if (PROXY_POOL.length === 1) {
+            const proxy = PROXY_POOL[0];
+            console.log(`   🔀 SEQUENTIAL MODE (1 proxy detected)`);
             console.log(`   🚀 ${proxy.label} ↓Desc (${halfPages} pages)`);
-            promises.push(fetchChainWithProxy(proxy, halfPages, CONFIG.FETCH_PAGE_DELAY, 'Desc'));
             
-            // Asc = serveurs les moins remplis d'abord (différente partie de la liste)
-            // Utilise un clone du proxy pour éviter les conflits de session
-            const proxyClone = { ...proxy, url: proxy.baseUrl };
-            rotateOneProxy(proxyClone);
-            console.log(`   🚀 ${proxy.label} ↑Asc  (${halfPages} pages)`);
-            promises.push(fetchChainWithProxy(proxyClone, halfPages, CONFIG.FETCH_PAGE_DELAY, 'Asc'));
-        }
+            const descResult = await fetchChainWithProxy(proxy, halfPages, CONFIG.FETCH_PAGE_DELAY, 'Desc', cancelFlag);
+            allResults.push(descResult);
 
-        if (PROXY_POOL.length === 0) {
+            if (!cancelFlag.cancelled) {
+                // Fresh session for Asc stream
+                const proxyClone = { ...proxy, url: proxy.baseUrl, errors: 0 };
+                rotateOneProxy(proxyClone);
+                console.log(`   🚀 ${proxy.label} ↑Asc  (${halfPages} pages)`);
+                const ascResult = await fetchChainWithProxy(proxyClone, halfPages, CONFIG.FETCH_PAGE_DELAY, 'Asc', cancelFlag);
+                allResults.push(ascResult);
+            }
+
+        } else if (PROXY_POOL.length > 1) {
+            // Multiple proxies: parallel mode with timeout
+            const promises = [];
+            
+            for (const proxy of PROXY_POOL) {
+                console.log(`   🚀 ${proxy.label} ↓Desc (${halfPages} pages)`);
+                promises.push(fetchChainWithProxy(proxy, halfPages, CONFIG.FETCH_PAGE_DELAY, 'Desc', cancelFlag));
+
+                const proxyClone = { ...proxy, url: proxy.baseUrl, errors: 0 };
+                rotateOneProxy(proxyClone);
+                console.log(`   🚀 ${proxy.label} ↑Asc  (${halfPages} pages)`);
+                promises.push(fetchChainWithProxy(proxyClone, halfPages, CONFIG.FETCH_PAGE_DELAY, 'Asc', cancelFlag));
+            }
+
+            console.log(`   ⏳ ${promises.length} streams running in parallel...\n`);
+
+            // v3.4 FIX #2: Proper timeout with cleanup
+            let cycleTimer;
+            const timeoutPromise = new Promise((_, reject) => {
+                cycleTimer = setTimeout(() => reject(new Error('CYCLE_TIMEOUT')), CONFIG.CYCLE_TIMEOUT);
+            });
+
+            try {
+                const settled = await Promise.race([
+                    Promise.allSettled(promises),
+                    timeoutPromise
+                ]);
+                clearTimeout(cycleTimer);
+                
+                for (const r of settled) {
+                    if (r.status === 'fulfilled') {
+                        allResults.push(r.value);
+                    } else {
+                        console.error(`   ❌ Stream failed: ${r.reason?.message}`);
+                    }
+                }
+            } catch (e) {
+                clearTimeout(cycleTimer);
+                console.error(`   🚨 ${e.message}: killing all streams after ${CONFIG.CYCLE_TIMEOUT/1000}s`);
+                cancelFlag.cancelled = true;
+                stats.total_cycle_timeouts++;
+                await sleep(2000); // Let streams notice the cancel
+            }
+
+        } else {
+            // No proxies: direct fetch
             console.log(`   🚀 DIRECT ↓Desc (${CONFIG.DIRECT_PAGES} pages)`);
-            promises.push(fetchChainWithProxy(null, CONFIG.DIRECT_PAGES, CONFIG.DIRECT_PAGE_DELAY, 'Desc'));
-            console.log(`   🚀 DIRECT ↑Asc  (${CONFIG.DIRECT_PAGES} pages)`);
-            promises.push(fetchChainWithProxy(null, CONFIG.DIRECT_PAGES, CONFIG.DIRECT_PAGE_DELAY, 'Asc'));
+            const descResult = await fetchChainWithProxy(null, CONFIG.DIRECT_PAGES, CONFIG.DIRECT_PAGE_DELAY, 'Desc', cancelFlag);
+            allResults.push(descResult);
+            
+            if (!cancelFlag.cancelled) {
+                console.log(`   🚀 DIRECT ↑Asc  (${CONFIG.DIRECT_PAGES} pages)`);
+                const ascResult = await fetchChainWithProxy(null, CONFIG.DIRECT_PAGES, CONFIG.DIRECT_PAGE_DELAY, 'Asc', cancelFlag);
+                allResults.push(ascResult);
+            }
         }
 
-        console.log(`   ⏳ ${promises.length} streams running...\n`);
-
-        // Max 4 min for entire fetch cycle — kill if stuck
-        const CYCLE_TIMEOUT = 240000;
-        const timeoutPromise = new Promise((_, reject) => 
-            setTimeout(() => reject(new Error('CYCLE_TIMEOUT')), CYCLE_TIMEOUT)
-        );
-
-        let results;
-        try {
-            results = await Promise.race([
-                Promise.allSettled(promises),
-                timeoutPromise
-            ]);
-        } catch (e) {
-            console.error(`   🚨 ${e.message}: fetch cycle killed after ${CYCLE_TIMEOUT/1000}s`);
-            results = [];
-        }
-
+        // Process all results
         const allServers = [];
         const perStream = {};
         let totalPages = 0;
 
-        for (const r of results) {
-            if (r.status === 'fulfilled') {
-                const { label, servers, pages } = r.value;
-                allServers.push(...servers);
-                totalPages += pages;
-                perStream[label] = { servers: servers.length, pages };
-                console.log(`   ✅ [${label}] ${servers.length} servers (${pages} pages)`);
-            } else {
-                console.error(`   ❌ Stream failed: ${r.reason?.message}`);
-            }
+        for (const { label, servers, pages } of allResults) {
+            allServers.push(...servers);
+            totalPages += pages;
+            perStream[label] = { servers: servers.length, pages };
+            console.log(`   ✅ [${label}] ${servers.length} servers (${pages} pages)`);
         }
 
-        // Dedup new fetch results
+        // Dedup
         const uniqueMap = new Map();
         for (const s of allServers) {
             const existing = uniqueMap.get(s.id);
@@ -599,28 +600,24 @@ async function fetchAllServersParallel() {
 
         if (newServers.length > 0 || globalCache.jobs.length > 0) {
             const prev = globalCache.jobs.length;
-            
-            // ── MERGE: keep old servers + add new ones ──
-            // Old servers stay in cache until they're stale (10 min)
-            const STALE_THRESHOLD = 600000; // 10 min
+
+            const STALE_THRESHOLD = 600000;
             const now = Date.now();
             const mergedMap = new Map();
-            
-            // Keep old servers that aren't stale
+
             for (const s of globalCache.jobs) {
                 if (now - s.fetched_at < STALE_THRESHOLD) {
                     mergedMap.set(s.id, s);
                 }
             }
-            
-            // Add/update with new servers
+
             for (const s of newServers) {
                 mergedMap.set(s.id, s);
             }
-            
+
             const merged = Array.from(mergedMap.values());
             const expired = prev - (merged.length - newServers.length);
-            
+
             globalCache.jobs = merged;
             globalCache.lastUpdate = Date.now();
             globalCache.lastFetchStats = {
@@ -631,12 +628,12 @@ async function fetchAllServersParallel() {
             };
 
             console.log('\n' + '═'.repeat(60));
-            console.log(`✅ Fetch: ${allServers.length} raw → ${newServers.length} new unique`);
+            console.log(`✅ Fetch: ${allServers.length} raw → ${newServers.length} new unique (${elapsed}s)`);
             console.log(`   📦 Cache: ${prev} old + ${newServers.length} new - stale = ${merged.length} total`);
 
             const bySource = {};
             for (const s of newServers) bySource[s.source] = (bySource[s.source] || 0) + 1;
-            console.log('   🏆 Unique per proxy:');
+            console.log('   🏆 Unique per stream:');
             for (const [src, cnt] of Object.entries(bySource).sort((a, b) => b[1] - a[1])) {
                 console.log(`      ${src.padEnd(16)} → ${cnt} (${((cnt / newServers.length) * 100).toFixed(1)}%)`);
             }
@@ -652,7 +649,8 @@ async function fetchAllServersParallel() {
         }
 
     } catch (e) {
-        console.error(`❌ Fatal: ${e.message}`);
+        console.error(`❌ Fatal fetch error: ${e.message}`);
+        console.error(e.stack);
     }
 
     globalCache.fetchInProgress = false;
@@ -673,28 +671,8 @@ function verifyApiKey(req, res, next) {
 // =====================================================
 // 🎯 JOB ASSIGNMENT — TRUE ZERO COLLISION
 // =====================================================
-//
-// FLOW:
-//   1. Detect region (from VPS ID)
-//   2. Rate limit check (OUTSIDE lock — fast reject)
-//   3. Cache check (OUTSIDE lock — fast reject)
-//   4. ACQUIRE GLOBAL LOCK ←── everything below is ATOMIC
-//   5.   Filter: available + not blacklisted + not in history
-//   6.   Sort with SHA-256(serverId, botId) → unique order
-//   7.   Take top 20
-//   8.   VERIFY no collision (safety net)
-//   9.   Mark as assigned in serverAssignments
-//   10.  Add to bot history
-//   11. RELEASE GLOBAL LOCK
-//   12. Respond
-//
-// Between steps 4 and 11, NO OTHER BOT can execute this code.
-// Therefore, step 5 always sees the LATEST state of serverAssignments,
-// including all assignments from all previous bots.
-// =====================================================
 
 async function handleJobAssignment(bot_id, vps_id, res) {
-    // ── 1. Detect region (no lock needed) ──
     let botRegion = null;
     for (const [region, config] of Object.entries(REGIONAL_CONFIG)) {
         if (vps_id >= config.vps_range[0] && vps_id <= config.vps_range[1]) {
@@ -704,29 +682,23 @@ async function handleJobAssignment(bot_id, vps_id, res) {
     }
     if (!botRegion) return res.status(400).json({ error: `Invalid VPS ID: ${vps_id}` });
 
-    // ── 2. Rate limit (no lock needed) ──
     const rl = checkBotRateLimit(bot_id);
     if (!rl.allowed) {
         stats.total_rate_limited++;
         return res.status(429).json({ error: 'Too fast', retry_in_ms: rl.wait_ms });
     }
 
-    // ── 3. Cache empty check (no lock needed) ──
     if (globalCache.jobs.length === 0) {
         return res.status(503).json({ error: 'Cache empty', retry_in: 10 });
     }
 
-    // ── 4. ACQUIRE GLOBAL LOCK ──
-    // From here, ONLY this bot is executing assignment logic.
     await globalAssignmentLock.acquire();
 
-    // Track max queue depth for monitoring
     if (globalAssignmentLock.queueLength > stats.lock_max_queue) {
         stats.lock_max_queue = globalAssignmentLock.queueLength;
     }
 
     try {
-        // ── 5. Filter available servers ──
         let skipBL = 0, skipAssign = 0, skipHist = 0;
         const available = [];
 
@@ -740,7 +712,6 @@ async function handleJobAssignment(bot_id, vps_id, res) {
         stats.total_blacklist_filtered += skipBL;
         stats.total_duplicates_skipped += skipHist;
 
-        // ── Handle empty pool ──
         if (available.length === 0) {
             const h = botHistory.get(bot_id);
             if (h && h.size > 0) {
@@ -760,13 +731,11 @@ async function handleJobAssignment(bot_id, vps_id, res) {
         return doAssign(available, bot_id, botRegion, res);
 
     } finally {
-        // ── 11. ALWAYS release lock ──
         globalAssignmentLock.release();
     }
 }
 
 function doAssign(available, bot_id, botRegion, res) {
-    // ── 6. SHA-256 sort → unique order for this bot ──
     const sorted = available
         .map(j => ({ ...j, _h: deterministicHashNum(j.id, bot_id) }))
         .sort((a, b) => a._h - b._h);
@@ -774,26 +743,20 @@ function doAssign(available, bot_id, botRegion, res) {
     const count = Math.min(CONFIG.SERVERS_PER_BOT, sorted.length);
     const candidates = sorted.slice(0, count);
 
-    // ── 8. COLLISION SAFETY NET ──
-    // This should NEVER trigger if the lock works correctly.
-    // But defense-in-depth is good practice.
     const finalIds = [];
     let collisionsDetected = 0;
 
     for (const job of candidates) {
         const existing = serverAssignments.get(job.id);
         if (existing && existing.bot_id !== bot_id && Date.now() < existing.expires_at) {
-            // THIS SHOULD NEVER HAPPEN with the global lock.
-            // If it does, log it loudly and skip this server.
             collisionsDetected++;
             stats.total_collisions_detected++;
-            console.error(`🚨🚨🚨 COLLISION DETECTED: ${job.id} already assigned to ${existing.bot_id}, skipping for ${bot_id}`);
+            console.error(`🚨 COLLISION: ${job.id} assigned to ${existing.bot_id}, skipping for ${bot_id}`);
             continue;
         }
         finalIds.push(job.id);
     }
 
-    // If we lost some servers to collisions, try to replace them
     if (collisionsDetected > 0 && sorted.length > count) {
         const extra = sorted.slice(count, count + collisionsDetected);
         for (const job of extra) {
@@ -806,14 +769,11 @@ function doAssign(available, bot_id, botRegion, res) {
         }
     }
 
-    // ── 9. Mark as assigned ──
     for (const id of finalIds) {
         assignServer(id, bot_id);
     }
 
-    // ── 10. Add to history ──
     addToBotHistory(bot_id, finalIds);
-
     stats.total_assignments++;
 
     const histSize = getBotHistory(bot_id).size;
@@ -821,7 +781,6 @@ function doAssign(available, bot_id, botRegion, res) {
 
     console.log(`✅ [${botRegion}] ${bot_id}: ${finalIds.length} servers | Pool: ${available.length}/${globalCache.jobs.length} | Hist: ${histSize}${lockQ > 0 ? ` | Queue: ${lockQ}` : ''}${collisionsDetected > 0 ? ` | ⚠️ ${collisionsDetected} collisions!` : ''}`);
 
-    // ── 12. Respond ──
     res.json({
         success: true,
         job_ids: finalIds,
@@ -833,7 +792,6 @@ function doAssign(available, bot_id, botRegion, res) {
         assignment_duration_ms: CONFIG.ASSIGNMENT_DURATION,
         history_size: histSize,
         cache_age_s: Math.floor((Date.now() - globalCache.lastUpdate) / 1000),
-        // v3.3: collision info (should always be 0)
         collisions_detected: collisionsDetected
     });
 }
@@ -906,7 +864,7 @@ app.get('/api/v1/stats', (req, res) => {
 
     res.json({
         game: STEAL_A_BRAINROT,
-        version: '3.3',
+        version: '3.4',
         cache: {
             total: globalCache.jobs.length,
             available: avail,
@@ -926,7 +884,6 @@ app.get('/api/v1/stats', (req, res) => {
         lock: {
             queue_now: globalAssignmentLock.queueLength,
             queue_max_ever: stats.lock_max_queue,
-            // If collisions_detected > 0, something is VERY wrong
             collisions_detected: stats.total_collisions_detected,
             collisions_resolved: stats.total_collisions_resolved
         },
@@ -944,17 +901,22 @@ app.get('/api/v1/stats', (req, res) => {
             cooldown_s: CONFIG.COOLDOWN_DURATION / 1000,
             servers_per_bot: CONFIG.SERVERS_PER_BOT,
             pages_per_proxy: CONFIG.PAGES_PER_PROXY,
-            refresh_s: CONFIG.CACHE_REFRESH_INTERVAL / 1000
+            refresh_s: CONFIG.CACHE_REFRESH_INTERVAL / 1000,
+            cycle_timeout_s: CONFIG.CYCLE_TIMEOUT / 1000,
+            watchdog_s: CONFIG.WATCHDOG_TIMEOUT / 1000,
+            max_rotations: CONFIG.MAX_ROTATIONS
         }
     });
 });
 
 app.get('/health', (req, res) => {
     res.json({
-        status: 'ok', version: '3.3',
+        status: 'ok', version: '3.4',
         servers: globalCache.jobs.length,
         uptime: Math.floor(process.uptime()),
         collisions_ever: stats.total_collisions_detected,
+        cycle_timeouts: stats.total_cycle_timeouts,
+        watchdog_resets: stats.total_watchdog_resets,
         memory_mb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024)
     });
 });
@@ -1001,14 +963,14 @@ setInterval(() => {
 }, 1800000);
 
 // =====================================================
-// 🚀 STARTUP
+// 🚀 STARTUP — v3.4: setInterval BEFORE initial fetch
 // =====================================================
 
-app.listen(PORT, async () => {
+app.listen(PORT, () => {
     console.clear();
     console.log('\n' + '═'.repeat(60));
-    console.log('🧠 STEAL A BRAINROT SCANNER - BACKEND v3.3');
-    console.log('   🔒 TRUE ZERO COLLISION (global lock)');
+    console.log('🧠 STEAL A BRAINROT SCANNER - BACKEND v3.4');
+    console.log('   🔒 ZERO COLLISION + ANTI-HANG');
     console.log('═'.repeat(60));
     console.log(`🎮 ${STEAL_A_BRAINROT.GAME_NAME}`);
     console.log(`📍 Place ID: ${STEAL_A_BRAINROT.PLACE_ID}`);
@@ -1020,19 +982,22 @@ app.listen(PORT, async () => {
 
     const totalBots = Object.values(REGIONAL_CONFIG).reduce((s, c) => s + c.expected_bots, 0);
 
-    console.log('\n🔒 ZERO-COLLISION PROOF:');
-    console.log('   1. Node.js = single-threaded');
-    console.log('   2. Global lock = only 1 bot assigns at a time');
-    console.log('   3. Filter sees ALL previous assignments');
-    console.log('   4. SHA-256 = unique sort order per bot');
-    console.log('   5. History = never re-scan same server');
-    console.log('   6. Safety net = collision detection + auto-resolve');
-    console.log(`   7. Lock cost: <1ms × ${totalBots} bots / 5s = ${Math.ceil(totalBots / 5)}ms/s (${((totalBots / 5) / 10).toFixed(1)}% CPU)`);
+    console.log('\n🔒 ZERO-COLLISION:');
+    console.log('   Global lock + SHA-256 + history + safety net');
+    console.log(`   Lock cost: ${Math.ceil(totalBots / 5)}ms/s (${((totalBots / 5) / 10).toFixed(1)}% CPU)`);
+
+    console.log('\n🛡️ ANTI-HANG (v3.4):');
+    console.log(`   1. setInterval BEFORE initial fetch`);
+    console.log(`   2. CYCLE_TIMEOUT: ${CONFIG.CYCLE_TIMEOUT/1000}s (timer cleaned up)`);
+    console.log(`   3. Stream cancellation (instant stop on timeout)`);
+    console.log(`   4. Sequential mode with 1 proxy`);
+    console.log(`   5. Max ${CONFIG.MAX_ROTATIONS} rotations, no reset after ${CONFIG.ROTATION_NORESET_AFTER}`);
+    console.log(`   6. Watchdog: ${CONFIG.WATCHDOG_TIMEOUT/1000}s force reset`);
 
     console.log('\n⚡ FETCH:');
     console.log(`   🌐 ${PROXY_POOL.length || 1} proxies × 2 sort orders (Desc+Asc)`);
     console.log(`   📄 ${CONFIG.PAGES_PER_PROXY} pages/proxy (${Math.ceil(CONFIG.PAGES_PER_PROXY/2)} per sort)`);
-    console.log(`   ⏱️  ~${Math.ceil(CONFIG.PAGES_PER_PROXY * (CONFIG.FETCH_PAGE_DELAY + 400) / 1000)}s per cycle`);
+    console.log(`   ${PROXY_POOL.length === 1 ? '🔀 SEQUENTIAL mode (1 proxy)' : '⚡ PARALLEL mode'}`);
     console.log(`   🔄 Every ${CONFIG.CACHE_REFRESH_INTERVAL / 1000}s`);
 
     console.log('\n📊 CAPACITY:');
@@ -1044,11 +1009,17 @@ app.listen(PORT, async () => {
     }
     console.log('═'.repeat(60) + '\n');
 
-    console.log('🔄 Initial fetch...\n');
-    await fetchAllServersParallel();
+    // v3.4 FIX #1: Start interval BEFORE initial fetch
+    // Ensures watchdog works even if initial fetch hangs
     setInterval(fetchAllServersParallel, CONFIG.CACHE_REFRESH_INTERVAL);
-    console.log('✅ Backend v3.3 ready!\n');
+
+    console.log('🔄 Initial fetch...\n');
+    fetchAllServersParallel().then(() => {
+        console.log('✅ Backend v3.4 ready!\n');
+    }).catch(e => {
+        console.error('❌ Initial fetch failed:', e.message);
+    });
 });
 
-process.on('unhandledRejection', (e) => console.error('❌ Unhandled:', e));
-process.on('uncaughtException', (e) => console.error('❌ Uncaught:', e));
+process.on('unhandledRejection', (e) => console.error('❌ Unhandled rejection:', e?.message || e));
+process.on('uncaughtException', (e) => console.error('❌ Uncaught exception:', e?.message || e));
