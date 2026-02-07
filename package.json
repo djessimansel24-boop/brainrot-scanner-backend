@@ -1,6 +1,6 @@
 {
   "name": "brainrot-scanner-backend",
-  "version": "2.0.0",
+  "version": "3.3.0",
   "description": "Backend pour scanner Steal a Brainrot avec 5 régions mondiales",
   "main": "server.js",
   "scripts": {
@@ -13,7 +13,7 @@
   "dependencies": {
     "express": "^4.18.2",
     "cors": "^2.8.5",
-    "request": "^2.88.2"
+    "https-proxy-agent": "^7.0.6"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
