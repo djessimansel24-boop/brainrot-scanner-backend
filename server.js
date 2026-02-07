@@ -1,25 +1,28 @@
 // =====================================================
-// 🧠 STEAL A BRAINROT SCANNER - BACKEND v3.5
+// 🧠 STEAL A BRAINROT SCANNER - BACKEND v3.6
 // =====================================================
 //
-// v3.5 — SEQUENTIAL TIMEOUT FIX
+// v3.6 — 3-PROXY PARALLEL + FAST COOLDOWN
 //
-// CORRECTIONS vs v3.4:
-//   🔴 FIX #6: CYCLE_TIMEOUT manquait en mode séquentiel
-//      Avant: mode séquentiel (1 proxy) n'avait PAS de timeout
-//      → stream bloqué = hang indéfini, seul watchdog 5min
-//      Fix: CYCLE_TIMEOUT enveloppe aussi le mode séquentiel
+// CHANGES vs v3.5:
+//   ⚡ Cooldown: 300s → 120s (servers recycle 2.5× faster)
+//   ⚡ Auto-cooldown on expire: 180s → 120s (consistent)
+//   🌐 Support for 3+ proxies (PROXY_1, PROXY_2, PROXY_3)
+//   🌐 Parallel mode auto-activates with >1 proxy
 //
-//   🔴 FIX #7: Watchdog ne tuait pas le stream bloqué
-//      Avant: watchdog reset fetchInProgress mais stream continue
-//      Fix: cancelFlag global, watchdog le set → stream s'arrête
+// MATH (3 proxies, 155 bots):
+//   Production: ~10,000 unique/cycle (3 proxies × Desc+Asc)
+//   Consumption: ~3,100/burst (155 bots × 20)
+//   Cooldown recycle: every 2 min → +3,000 back in pool
+//   Result: pool never hits 0
 //
-// CONSERVÉ de v3.4:
-//   ✅ FIX #1-5 (setInterval, timer cleanup, cancel, sequential, rotations)
-//   ✅ Global lock = zero collision
-//   ✅ SHA-256 distribution
-//   ✅ Per-bot history
-//   ✅ Blacklist + cooldowns
+// CONSERVÉ de v3.5:
+//   ✅ CYCLE_TIMEOUT on ALL modes (sequential + parallel)
+//   ✅ Stream cancellation via cancelFlag
+//   ✅ Watchdog kills stuck streams
+//   ✅ Partial results survive timeout
+//   ✅ Cooldown delete fix (Bug A)
+//   ✅ Zero collision (global lock + SHA-256)
 // =====================================================
 
 const express = require('express');
@@ -58,6 +61,7 @@ const REGIONAL_CONFIG = {
 };
 
 function initProxyPool() {
+    // Named regional proxies (backward compat)
     const envMap = {
         'PROXY_US':            'US',
         'PROXY_EU':            'EU',
@@ -71,7 +75,20 @@ function initProxyPool() {
             PROXY_POOL.push({ baseUrl: url, url, label, errors: 0, lastError: 0, lastFetch: {} });
         }
     }
+
+    // Numbered proxies: PROXY_1, PROXY_2, ... PROXY_10
+    // Use these when you have multiple proxies on the same provider
+    for (let i = 1; i <= 10; i++) {
+        const url = process.env[`PROXY_${i}`];
+        if (url) {
+            PROXY_POOL.push({ baseUrl: url, url, label: `P${i}`, errors: 0, lastError: 0, lastFetch: {} });
+        }
+    }
+
     console.log(`🔧 Proxy pool: ${PROXY_POOL.length} proxies`);
+    for (const p of PROXY_POOL) {
+        console.log(`   📡 ${p.label}: ${p.baseUrl.replace(/:[^:@]+@/, ':***@')}`);
+    }
     if (PROXY_POOL.length === 0) {
         console.warn('⚠️  NO PROXIES configured!');
     }
@@ -110,8 +127,8 @@ function rotateProxySessions() {
 const CONFIG = {
     // ── Assignation ──
     ASSIGNMENT_DURATION: 120000,
-    COOLDOWN_DURATION: 300000,
-    AUTO_COOLDOWN_ON_EXPIRE: 180000,
+    COOLDOWN_DURATION: 120000,         // v3.6: 5min → 2min (servers recyclent 2.5× plus vite)
+    AUTO_COOLDOWN_ON_EXPIRE: 120000,   // v3.6: cohérent avec COOLDOWN_DURATION
     SERVERS_PER_BOT: 20,
 
     // ── Fetch ──
@@ -136,7 +153,7 @@ const CONFIG = {
     // ── Cleanup ──
     CLEANUP_INTERVAL: 10000,
 
-    // ── v3.4/3.5: Anti-hang ──
+    // ── v3.6: Anti-hang (from v3.4/3.5) ──
     CYCLE_TIMEOUT: 240000,
     WATCHDOG_TIMEOUT: 300000,
     MAX_ROTATIONS: 10,
@@ -252,7 +269,7 @@ const globalCache = {
     lastFetchStats: {}
 };
 
-// v3.5: Global cancel flag so watchdog can kill stuck streams
+// v3.6: Global cancel flag so watchdog can kill stuck streams
 let globalCancelFlag = { cancelled: false };
 
 const serverAssignments = new Map();
@@ -373,7 +390,7 @@ function checkBotRateLimit(botId) {
 }
 
 // =====================================================
-// 🌐 FETCH — v3.5 with CYCLE_TIMEOUT on ALL modes
+// 🌐 FETCH — v3.6 with CYCLE_TIMEOUT on ALL modes
 // =====================================================
 
 async function fetchChainWithProxy(proxy, maxPages, pageDelay, sortOrder, cancelFlag) {
@@ -458,7 +475,7 @@ async function fetchChainWithProxy(proxy, maxPages, pageDelay, sortOrder, cancel
     return { label, servers, pages: pageCount };
 }
 
-// v3.5: Run fetch logic with CYCLE_TIMEOUT wrapper (used by ALL modes)
+// Run fetch logic with CYCLE_TIMEOUT wrapper (used by ALL modes)
 async function fetchWithTimeout(fetchFn, cancelFlag) {
     let cycleTimer;
     
@@ -494,7 +511,7 @@ async function fetchAllServersParallel() {
         const stuckTime = Date.now() - (globalCache.fetchStartedAt || 0);
         if (stuckTime > CONFIG.WATCHDOG_TIMEOUT) {
             console.error(`🚨 WATCHDOG: Fetch stuck for ${Math.round(stuckTime/1000)}s, force resetting`);
-            // v3.5 FIX #7: Watchdog cancels the stuck stream
+            // FIX #7: Watchdog cancels the stuck stream
             globalCancelFlag.cancelled = true;
             stats.total_watchdog_resets++;
             await sleep(2000); // Let streams die BEFORE releasing the lock
@@ -509,7 +526,7 @@ async function fetchAllServersParallel() {
     globalCache.fetchStartedAt = Date.now();
     const startTime = Date.now();
 
-    // v3.5: Fresh cancel flag for this cycle, stored globally for watchdog access
+    // v3.6: Fresh cancel flag for this cycle, stored globally for watchdog access
     const cancelFlag = { cancelled: false };
     globalCancelFlag = cancelFlag;
 
@@ -523,14 +540,14 @@ async function fetchAllServersParallel() {
         const allResults = [];
         const halfPages = Math.ceil(CONFIG.PAGES_PER_PROXY / 2);
 
-        // v3.5: ALL modes wrapped in CYCLE_TIMEOUT via fetchWithTimeout
+        // v3.6: ALL modes wrapped in CYCLE_TIMEOUT via fetchWithTimeout
 
         if (PROXY_POOL.length === 1) {
             const proxy = PROXY_POOL[0];
             console.log(`   🔀 SEQUENTIAL MODE (1 proxy detected)`);
 
-            // v3.5 FIX #6: Sequential mode now has CYCLE_TIMEOUT
-            // v3.5 FIX B: Shared array so partial results survive timeout
+            // FIX #6: Sequential mode now has CYCLE_TIMEOUT
+            // FIX B: Shared array so partial results survive timeout
             const partialResults = [];
             await fetchWithTimeout(async () => {
                 console.log(`   🚀 ${proxy.label} ↓Desc (${halfPages} pages)`);
@@ -566,7 +583,7 @@ async function fetchAllServersParallel() {
 
             console.log(`   ⏳ ${promises.length} streams running in parallel...\n`);
 
-            // v3.5 FIX B: Partial results survive timeout
+            // FIX B: Partial results survive timeout
             const parResult = await fetchWithTimeout(async () => {
                 return await Promise.allSettled(promises);
             }, cancelFlag);
@@ -905,7 +922,7 @@ app.get('/api/v1/stats', (req, res) => {
 
     res.json({
         game: STEAL_A_BRAINROT,
-        version: '3.5',
+        version: '3.6',
         cache: {
             total: globalCache.jobs.length,
             available: avail,
@@ -952,7 +969,7 @@ app.get('/api/v1/stats', (req, res) => {
 
 app.get('/health', (req, res) => {
     res.json({
-        status: 'ok', version: '3.5',
+        status: 'ok', version: '3.6',
         servers: globalCache.jobs.length,
         uptime: Math.floor(process.uptime()),
         collisions_ever: stats.total_collisions_detected,
@@ -1005,14 +1022,14 @@ setInterval(() => {
 }, 1800000);
 
 // =====================================================
-// 🚀 STARTUP — v3.5
+// 🚀 STARTUP — v3.6
 // =====================================================
 
 app.listen(PORT, () => {
     console.clear();
     console.log('\n' + '═'.repeat(60));
-    console.log('🧠 STEAL A BRAINROT SCANNER - BACKEND v3.5');
-    console.log('   🔒 ZERO COLLISION + ANTI-HANG + TIMEOUT FIX');
+    console.log('🧠 STEAL A BRAINROT SCANNER - BACKEND v3.6');
+    console.log('   🔒 ZERO COLLISION + 3-PROXY PARALLEL + FAST COOLDOWN');
     console.log('═'.repeat(60));
     console.log(`🎮 ${STEAL_A_BRAINROT.GAME_NAME}`);
     console.log(`📍 Place ID: ${STEAL_A_BRAINROT.PLACE_ID}`);
@@ -1028,7 +1045,7 @@ app.listen(PORT, () => {
     console.log('   Global lock + SHA-256 + history + safety net');
     console.log(`   Lock cost: ${Math.ceil(totalBots / 5)}ms/s (${((totalBots / 5) / 10).toFixed(1)}% CPU)`);
 
-    console.log('\n🛡️ ANTI-HANG (v3.5):');
+    console.log('\n🛡️ ANTI-HANG (v3.6):');
     console.log(`   1. setInterval BEFORE initial fetch`);
     console.log(`   2. CYCLE_TIMEOUT: ${CONFIG.CYCLE_TIMEOUT/1000}s (ALL modes — sequential + parallel)`);
     console.log(`   3. Stream cancellation (instant stop on timeout)`);
@@ -1056,7 +1073,7 @@ app.listen(PORT, () => {
 
     console.log('🔄 Initial fetch...\n');
     fetchAllServersParallel().then(() => {
-        console.log('✅ Backend v3.5 ready!\n');
+        console.log('✅ Backend v3.6 ready!\n');
     }).catch(e => {
         console.error('❌ Initial fetch failed:', e.message);
     });
