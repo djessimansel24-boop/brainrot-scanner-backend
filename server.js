@@ -5,15 +5,15 @@
 // v3.6 — 3-PROXY PARALLEL + FAST COOLDOWN
 //
 // CHANGES vs v3.5:
-//   ⚡ Cooldown: 300s → 120s (servers recycle 2.5× faster)
-//   ⚡ Auto-cooldown on expire: 180s → 120s (consistent)
+//   ⚡ Cooldown: 300s → 60s (servers recycle 5× faster)
+//   ⚡ Auto-cooldown on expire: 180s → 60s (consistent)
 //   🌐 Support for 3+ proxies (PROXY_1, PROXY_2, PROXY_3)
 //   🌐 Parallel mode auto-activates with >1 proxy
 //
 // MATH (3 proxies, 155 bots):
 //   Production: ~10,000 unique/cycle (3 proxies × Desc+Asc)
 //   Consumption: ~3,100/burst (155 bots × 20)
-//   Cooldown recycle: every 2 min → +3,000 back in pool
+//   Cooldown recycle: every 1 min → +3,000 back in pool
 //   Result: pool never hits 0
 //
 // CONSERVÉ de v3.5:
@@ -127,8 +127,8 @@ function rotateProxySessions() {
 const CONFIG = {
     // ── Assignation ──
     ASSIGNMENT_DURATION: 120000,
-    COOLDOWN_DURATION: 120000,         // v3.6: 5min → 2min (servers recyclent 2.5× plus vite)
-    AUTO_COOLDOWN_ON_EXPIRE: 120000,   // v3.6: cohérent avec COOLDOWN_DURATION
+    COOLDOWN_DURATION: 60000,          // v3.6: 2min → 1min (servers recyclent encore plus vite)
+    AUTO_COOLDOWN_ON_EXPIRE: 60000,    // v3.6: cohérent avec COOLDOWN_DURATION
     SERVERS_PER_BOT: 20,
 
     // ── Fetch ──
