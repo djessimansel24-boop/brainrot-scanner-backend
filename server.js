@@ -89,12 +89,48 @@ function initProxyPool() {
     for (const [envKey, label] of Object.entries(envMap)) {
         const url = process.env[envKey];
         if (url) {
-            PROXY_POOL.push({ url, label, errors: 0, lastError: 0, lastFetch: {} });
+            PROXY_POOL.push({ baseUrl: url, url, label, errors: 0, lastError: 0, lastFetch: {} });
         }
     }
     console.log(`🔧 Proxy pool: ${PROXY_POOL.length} proxies`);
     if (PROXY_POOL.length === 0) {
         console.warn('⚠️  NO PROXIES configured!');
+    }
+}
+
+// =====================================================
+// 🔄 SMARTPROXY SESSION ROTATION
+// =====================================================
+// Smartproxy format:
+//   http://user_area-US_life-15_session-XXXXX:pass@proxy.smartproxy.net:3120
+//
+// Le session ID détermine quelle IP résidentielle tu reçois.
+// Même session = même IP pendant 15 min.
+// Nouvelle session = nouvelle IP = pas de rate limit Roblox.
+//
+// On génère un nouveau session ID À CHAQUE CYCLE DE FETCH
+// pour toujours avoir une IP fraîche.
+// =====================================================
+
+function randomSessionId() {
+    return crypto.randomBytes(6).toString('hex');
+}
+
+function rotateOneProxy(proxy) {
+    const base = proxy.baseUrl;
+    if (base.includes('_session-')) {
+        proxy.url = base.replace(/_session-[a-zA-Z0-9]+/, `_session-${randomSessionId()}`);
+    } else if (base.includes('_life-')) {
+        proxy.url = base.replace(/(_life-\d+)/, `$1_session-${randomSessionId()}`);
+    } else {
+        proxy.url = base;
+    }
+}
+
+function rotateProxySessions() {
+    for (const proxy of PROXY_POOL) {
+        rotateOneProxy(proxy);
+        console.log(`   🔄 [${proxy.label}] New session → fresh IP`);
     }
 }
 
@@ -389,6 +425,8 @@ async function fetchChainWithProxy(proxy, maxPages, pageDelay) {
     let cursor = null;
     let pageCount = 0;
     let consecutiveErrors = 0;
+    let rotations = 0;
+    const MAX_ROTATIONS = 5; // Max 5 IP rotations per fetch cycle
 
     while (pageCount < maxPages) {
         try {
@@ -427,7 +465,17 @@ async function fetchChainWithProxy(proxy, maxPages, pageDelay) {
             consecutiveErrors++;
             if (err.message === 'RATE_LIMITED') {
                 console.warn(`   🚦 [${label}] Rate limited at page ${pageCount + 1}`);
-                if (proxy) { proxy.errors++; proxy.lastError = Date.now(); }
+                if (proxy) {
+                    proxy.errors++;
+                    proxy.lastError = Date.now();
+                    // Rotate session → get fresh IP (max 5 rotations)
+                    if (rotations < MAX_ROTATIONS) {
+                        rotateOneProxy(proxy);
+                        rotations++;
+                        console.warn(`   🔄 [${label}] Rotated to new IP (${rotations}/${MAX_ROTATIONS})`);
+                        consecutiveErrors = 0; // New IP = reset error count
+                    }
+                }
                 await sleep(CONFIG.FETCH_RATE_LIMIT_BACKOFF);
             } else {
                 console.warn(`   ⚠️ [${label}] Page ${pageCount + 1}: ${err.message}`);
@@ -456,6 +504,9 @@ async function fetchAllServersParallel() {
     console.log('\n' + '═'.repeat(60));
     console.log('🌐 PARALLEL FETCH — All proxies simultaneously');
     console.log('═'.repeat(60));
+
+    // Rotate proxy sessions → fresh IP for each cycle
+    rotateProxySessions();
 
     try {
         const promises = [];
