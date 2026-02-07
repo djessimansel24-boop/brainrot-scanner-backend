@@ -2,7 +2,7 @@
 // 🧠 STEAL A BRAINROT SCANNER - BACKEND v3.6
 // =====================================================
 //
-// v3.6 — 3-PROXY PARALLEL + FAST COOLDOWN
+// v3.6 — 8-PROXY WAVE MODE + FAST COOLDOWN
 //
 // CHANGES vs v3.5:
 //   ⚡ Cooldown: 300s → 60s (servers recycle 5× faster)
@@ -133,11 +133,15 @@ const CONFIG = {
 
     // ── Fetch ──
     CACHE_REFRESH_INTERVAL: 180000,
-    PAGES_PER_PROXY: 80,
+    PAGES_PER_PROXY: 30,              // v3.6: réduit car plus de proxies (15 per sort)
     FETCH_PAGE_DELAY: 1500,
     FETCH_PAGE_TIMEOUT: 12000,
     FETCH_MAX_CONSECUTIVE_ERRORS: 4,
     FETCH_RATE_LIMIT_BACKOFF: 5000,
+
+    // ── Wave mode (multi-proxy) ──
+    PROXIES_PER_WAVE: 2,              // 2 proxies par vague = 4 streams simultanés
+    WAVE_DELAY: 20000,                // 20s entre chaque vague (rate limit cool off)
 
     // ── Direct fetch (sans proxy) ──
     DIRECT_PAGES: 50,
@@ -154,8 +158,8 @@ const CONFIG = {
     CLEANUP_INTERVAL: 10000,
 
     // ── v3.6: Anti-hang (from v3.4/3.5) ──
-    CYCLE_TIMEOUT: 240000,
-    WATCHDOG_TIMEOUT: 300000,
+    CYCLE_TIMEOUT: 300000,            // 5min (waves need more time than parallel)
+    WATCHDOG_TIMEOUT: 360000,         // 6min
     MAX_ROTATIONS: 10,
     ROTATION_NORESET_AFTER: 7,
 };
@@ -568,45 +572,62 @@ async function fetchAllServersParallel() {
             allResults.push(...partialResults);
 
         } else if (PROXY_POOL.length > 1) {
-            // Multiple proxies: parallel mode with timeout
-            const promises = [];
-            
-            for (const proxy of PROXY_POOL) {
-                console.log(`   🚀 ${proxy.label} ↓Desc (${halfPages} pages)`);
-                promises.push(fetchChainWithProxy(proxy, halfPages, CONFIG.FETCH_PAGE_DELAY, 'Desc', cancelFlag));
-
-                const proxyClone = { ...proxy, url: proxy.baseUrl, errors: 0 };
-                rotateOneProxy(proxyClone);
-                console.log(`   🚀 ${proxy.label} ↑Asc  (${halfPages} pages)`);
-                promises.push(fetchChainWithProxy(proxyClone, halfPages, CONFIG.FETCH_PAGE_DELAY, 'Asc', cancelFlag));
+            // v3.6: WAVE MODE — proxies in batches to avoid mass rate limiting
+            const waveSize = CONFIG.PROXIES_PER_WAVE;
+            const waves = [];
+            for (let i = 0; i < PROXY_POOL.length; i += waveSize) {
+                waves.push(PROXY_POOL.slice(i, i + waveSize));
             }
 
-            console.log(`   ⏳ ${promises.length} streams running in parallel...\n`);
+            console.log(`   🌊 WAVE MODE: ${waves.length} waves × ${waveSize} proxies (${PROXY_POOL.length} total)`);
 
-            // FIX B: Partial results survive timeout
-            const parResult = await fetchWithTimeout(async () => {
-                return await Promise.allSettled(promises);
+            const partialWaveResults = [];
+            await fetchWithTimeout(async () => {
+                for (let w = 0; w < waves.length; w++) {
+                    if (cancelFlag.cancelled) break;
+
+                    const wave = waves[w];
+                    console.log(`\n   🌊 Wave ${w + 1}/${waves.length}: ${wave.map(p => p.label).join(' + ')}`);
+
+                    const wavePromises = [];
+                    for (const proxy of wave) {
+                        // Desc stream
+                        console.log(`      🚀 ${proxy.label} ↓Desc (${halfPages} pages)`);
+                        wavePromises.push(fetchChainWithProxy(proxy, halfPages, CONFIG.FETCH_PAGE_DELAY, 'Desc', cancelFlag));
+
+                        // Asc stream (cloned proxy with fresh session)
+                        const proxyClone = { ...proxy, url: proxy.baseUrl, errors: 0 };
+                        rotateOneProxy(proxyClone);
+                        console.log(`      🚀 ${proxy.label} ↑Asc  (${halfPages} pages)`);
+                        wavePromises.push(fetchChainWithProxy(proxyClone, halfPages, CONFIG.FETCH_PAGE_DELAY, 'Asc', cancelFlag));
+                    }
+
+                    console.log(`      ⏳ ${wavePromises.length} streams...`);
+                    const waveResults = await Promise.allSettled(wavePromises);
+
+                    for (const r of waveResults) {
+                        if (r.status === 'fulfilled') {
+                            partialWaveResults.push(r.value);
+                        } else {
+                            console.error(`      ❌ Stream failed: ${r.reason?.message}`);
+                        }
+                    }
+
+                    const waveServers = waveResults
+                        .filter(r => r.status === 'fulfilled')
+                        .reduce((sum, r) => sum + r.value.servers.length, 0);
+                    console.log(`      ✅ Wave ${w + 1} done: ${waveServers} servers`);
+
+                    // Wait between waves (except last)
+                    if (w < waves.length - 1 && !cancelFlag.cancelled) {
+                        console.log(`      ⏸️ Cooling ${CONFIG.WAVE_DELAY / 1000}s before next wave...`);
+                        await sleep(CONFIG.WAVE_DELAY);
+                    }
+                }
+                return partialWaveResults;
             }, cancelFlag);
 
-            if (parResult) {
-                for (const r of parResult) {
-                    if (r.status === 'fulfilled') {
-                        allResults.push(r.value);
-                    } else {
-                        console.error(`   ❌ Stream failed: ${r.reason?.message}`);
-                    }
-                }
-            }
-            // On timeout, promises may still resolve — collect what we can
-            if (!parResult) {
-                await sleep(3000); // Give streams time to notice cancel
-                const settled = await Promise.allSettled(promises);
-                for (const r of settled) {
-                    if (r.status === 'fulfilled' && r.value.servers.length > 0) {
-                        allResults.push(r.value);
-                    }
-                }
-            }
+            allResults.push(...partialWaveResults);
 
         } else {
             // No proxies: direct fetch
@@ -962,7 +983,9 @@ app.get('/api/v1/stats', (req, res) => {
             refresh_s: CONFIG.CACHE_REFRESH_INTERVAL / 1000,
             cycle_timeout_s: CONFIG.CYCLE_TIMEOUT / 1000,
             watchdog_s: CONFIG.WATCHDOG_TIMEOUT / 1000,
-            max_rotations: CONFIG.MAX_ROTATIONS
+            max_rotations: CONFIG.MAX_ROTATIONS,
+            proxies_per_wave: CONFIG.PROXIES_PER_WAVE,
+            wave_delay_s: CONFIG.WAVE_DELAY / 1000
         }
     });
 });
@@ -1029,7 +1052,7 @@ app.listen(PORT, () => {
     console.clear();
     console.log('\n' + '═'.repeat(60));
     console.log('🧠 STEAL A BRAINROT SCANNER - BACKEND v3.6');
-    console.log('   🔒 ZERO COLLISION + 3-PROXY PARALLEL + FAST COOLDOWN');
+    console.log('   🔒 ZERO COLLISION + WAVE MODE + FAST COOLDOWN');
     console.log('═'.repeat(60));
     console.log(`🎮 ${STEAL_A_BRAINROT.GAME_NAME}`);
     console.log(`📍 Place ID: ${STEAL_A_BRAINROT.PLACE_ID}`);
@@ -1056,7 +1079,12 @@ app.listen(PORT, () => {
     console.log('\n⚡ FETCH:');
     console.log(`   🌐 ${PROXY_POOL.length || 1} proxies × 2 sort orders (Desc+Asc)`);
     console.log(`   📄 ${CONFIG.PAGES_PER_PROXY} pages/proxy (${Math.ceil(CONFIG.PAGES_PER_PROXY/2)} per sort)`);
-    console.log(`   ${PROXY_POOL.length === 1 ? '🔀 SEQUENTIAL mode (1 proxy)' : '⚡ PARALLEL mode'}`);
+    if (PROXY_POOL.length > 1) {
+        const waves = Math.ceil(PROXY_POOL.length / CONFIG.PROXIES_PER_WAVE);
+        console.log(`   🌊 WAVE mode: ${waves} waves × ${CONFIG.PROXIES_PER_WAVE} proxies (${CONFIG.WAVE_DELAY/1000}s gap)`);
+    } else {
+        console.log(`   ${PROXY_POOL.length === 1 ? '🔀 SEQUENTIAL mode (1 proxy)' : '⚡ DIRECT mode'}`);
+    }
     console.log(`   🔄 Every ${CONFIG.CACHE_REFRESH_INTERVAL / 1000}s`);
 
     console.log('\n📊 CAPACITY:');
