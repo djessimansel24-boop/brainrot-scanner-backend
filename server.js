@@ -148,7 +148,7 @@ const CONFIG = {
     // ── Fetch parallèle ──
     CACHE_REFRESH_INTERVAL: 120000,  // 2 min
     PAGES_PER_PROXY: 50,             // 50 pages × 100 = 5,000/proxy
-    FETCH_PAGE_DELAY: 600,           // 600ms entre pages (safe: ~100 req/min/IP)
+    FETCH_PAGE_DELAY: 1500,           // 1.5s entre pages (Roblox rate limit strict)
     FETCH_PAGE_TIMEOUT: 12000,
     FETCH_MAX_CONSECUTIVE_ERRORS: 4,
     FETCH_RATE_LIMIT_BACKOFF: 5000,
@@ -962,7 +962,7 @@ app.listen(PORT, async () => {
     console.log('\n⚡ FETCH:');
     console.log(`   🌐 ${PROXY_POOL.length || 1} parallel streams`);
     console.log(`   📄 ${CONFIG.PAGES_PER_PROXY} pages/proxy`);
-    console.log(`   ⏱️  ~${Math.ceil(CONFIG.PAGES_PER_PROXY * CONFIG.FETCH_PAGE_DELAY / 1000)}s per cycle`);
+    console.log(`   ⏱️  ~${Math.ceil(CONFIG.PAGES_PER_PROXY * (CONFIG.FETCH_PAGE_DELAY + 400) / 1000)}s per cycle`);
     console.log(`   🔄 Every ${CONFIG.CACHE_REFRESH_INTERVAL / 1000}s`);
 
     console.log('\n📊 CAPACITY:');
