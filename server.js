@@ -133,7 +133,7 @@ const CONFIG = {
 
     // ── Fetch ──
     CACHE_REFRESH_INTERVAL: 180000,
-    PAGES_PER_PROXY: 30,              // v3.6: réduit car plus de proxies (15 per sort)
+    PAGES_PER_PROXY: 80,              // 40 per sort direction — deep fetch needed
     FETCH_PAGE_DELAY: 1500,
     FETCH_PAGE_TIMEOUT: 12000,
     FETCH_MAX_CONSECUTIVE_ERRORS: 4,
@@ -158,8 +158,8 @@ const CONFIG = {
     CLEANUP_INTERVAL: 10000,
 
     // ── v3.6: Anti-hang (from v3.4/3.5) ──
-    CYCLE_TIMEOUT: 300000,            // 5min (waves need more time than parallel)
-    WATCHDOG_TIMEOUT: 360000,         // 6min
+    CYCLE_TIMEOUT: 420000,            // 7min (4 waves × 80s each + buffer)
+    WATCHDOG_TIMEOUT: 480000,         // 8min
     MAX_ROTATIONS: 10,
     ROTATION_NORESET_AFTER: 7,
 };
