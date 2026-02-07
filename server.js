@@ -1,34 +1,23 @@
 // =====================================================
-// 🧠 STEAL A BRAINROT SCANNER - BACKEND v3.4
+// 🧠 STEAL A BRAINROT SCANNER - BACKEND v3.5
 // =====================================================
 //
-// v3.4 — ANTI-HANG + PERFORMANCE FIX
+// v3.5 — SEQUENTIAL TIMEOUT FIX
 //
-// CORRECTIONS vs v3.3:
-//   🔴 FIX #1: setInterval AVANT le fetch initial
-//      Avant: si le premier fetch hang → setInterval jamais démarré → watchdog mort
-//      Fix: setInterval démarre AVANT, fetch initial en parallèle
+// CORRECTIONS vs v3.4:
+//   🔴 FIX #6: CYCLE_TIMEOUT manquait en mode séquentiel
+//      Avant: mode séquentiel (1 proxy) n'avait PAS de timeout
+//      → stream bloqué = hang indéfini, seul watchdog 5min
+//      Fix: CYCLE_TIMEOUT enveloppe aussi le mode séquentiel
 //
-//   🔴 FIX #2: CYCLE_TIMEOUT timer cleanup
-//      Avant: timer orphelin → unhandled rejection → crash possible
-//      Fix: clearTimeout quand Promise.allSettled finit en premier
+//   🔴 FIX #7: Watchdog ne tuait pas le stream bloqué
+//      Avant: watchdog reset fetchInProgress mais stream continue
+//      Fix: cancelFlag global, watchdog le set → stream s'arrête
 //
-//   🔴 FIX #3: Cancellation flag pour streams
-//      Avant: CYCLE_TIMEOUT fire mais streams continuent en arrière-plan
-//      Fix: flag partagé, streams vérifient avant chaque page
-//
-//   🔴 FIX #4: Streams séquentiels avec 1 proxy
-//      Avant: 2 streams simultanés sur 1 proxy = rate limit storm
-//      Fix: Desc d'abord, puis Asc avec les pages restantes
-//
-//   🔴 FIX #5: Max rotations réduit + erreurs non-reset après 7
-//      Avant: 15 rotations × reset = boucle de 5-6 min
-//      Fix: 10 rotations max, pas de reset après 7
-//
-// CONSERVÉ de v3.3:
+// CONSERVÉ de v3.4:
+//   ✅ FIX #1-5 (setInterval, timer cleanup, cancel, sequential, rotations)
 //   ✅ Global lock = zero collision
 //   ✅ SHA-256 distribution
-//   ✅ Watchdog 5 min
 //   ✅ Per-bot history
 //   ✅ Blacklist + cooldowns
 // =====================================================
@@ -148,7 +137,7 @@ const CONFIG = {
     // ── Cleanup ──
     CLEANUP_INTERVAL: 10000,
 
-    // ── v3.4: Anti-hang ──
+    // ── v3.4/3.5: Anti-hang ──
     CYCLE_TIMEOUT: 240000,
     WATCHDOG_TIMEOUT: 300000,
     MAX_ROTATIONS: 10,
@@ -263,6 +252,9 @@ const globalCache = {
     fetchStartedAt: 0,
     lastFetchStats: {}
 };
+
+// v3.5: Global cancel flag so watchdog can kill stuck streams
+let globalCancelFlag = { cancelled: false };
 
 const serverAssignments = new Map();
 const serverCooldowns = new Map();
@@ -382,7 +374,7 @@ function checkBotRateLimit(botId) {
 }
 
 // =====================================================
-// 🌐 FETCH — v3.4 with cancellation + sequential mode
+// 🌐 FETCH — v3.5 with CYCLE_TIMEOUT on ALL modes
 // =====================================================
 
 async function fetchChainWithProxy(proxy, maxPages, pageDelay, sortOrder, cancelFlag) {
@@ -395,7 +387,6 @@ async function fetchChainWithProxy(proxy, maxPages, pageDelay, sortOrder, cancel
     let rotations = 0;
 
     while (pageCount < maxPages) {
-        // v3.4 FIX #3: Check cancellation before each page
         if (cancelFlag.cancelled) {
             console.log(`   🛑 [${label}] Cancelled at page ${pageCount}`);
             stats.total_stream_cancels++;
@@ -447,7 +438,6 @@ async function fetchChainWithProxy(proxy, maxPages, pageDelay, sortOrder, cancel
                         rotateOneProxy(proxy);
                         rotations++;
                         console.warn(`   🔄 [${label}] Rotated to new IP (${rotations}/${CONFIG.MAX_ROTATIONS})`);
-                        // v3.4 FIX #5: Stop resetting errors after ROTATION_NORESET_AFTER
                         if (rotations <= CONFIG.ROTATION_NORESET_AFTER) {
                             consecutiveErrors = 0;
                         }
@@ -469,13 +459,47 @@ async function fetchChainWithProxy(proxy, maxPages, pageDelay, sortOrder, cancel
     return { label, servers, pages: pageCount };
 }
 
+// v3.5: Run fetch logic with CYCLE_TIMEOUT wrapper (used by ALL modes)
+async function fetchWithTimeout(fetchFn, cancelFlag) {
+    let cycleTimer;
+    
+    const timeoutPromise = new Promise((_, reject) => {
+        cycleTimer = setTimeout(() => {
+            reject(new Error('CYCLE_TIMEOUT'));
+        }, CONFIG.CYCLE_TIMEOUT);
+    });
+
+    try {
+        const result = await Promise.race([
+            fetchFn(),
+            timeoutPromise
+        ]);
+        clearTimeout(cycleTimer);
+        return result;
+    } catch (e) {
+        clearTimeout(cycleTimer);
+        if (e.message === 'CYCLE_TIMEOUT') {
+            console.error(`   🚨 CYCLE_TIMEOUT: killing streams after ${CONFIG.CYCLE_TIMEOUT/1000}s`);
+            cancelFlag.cancelled = true;
+            stats.total_cycle_timeouts++;
+            await sleep(2000); // Let streams notice the cancel
+        } else {
+            throw e;
+        }
+        return null;
+    }
+}
+
 async function fetchAllServersParallel() {
     if (globalCache.fetchInProgress) {
         const stuckTime = Date.now() - (globalCache.fetchStartedAt || 0);
         if (stuckTime > CONFIG.WATCHDOG_TIMEOUT) {
             console.error(`🚨 WATCHDOG: Fetch stuck for ${Math.round(stuckTime/1000)}s, force resetting`);
+            // v3.5 FIX #7: Watchdog cancels the stuck stream
+            globalCancelFlag.cancelled = true;
             globalCache.fetchInProgress = false;
             stats.total_watchdog_resets++;
+            await sleep(2000); // Let streams die
         } else {
             console.log(`⏭️ Fetch already running (${Math.round(stuckTime/1000)}s)`);
             return;
@@ -486,8 +510,9 @@ async function fetchAllServersParallel() {
     globalCache.fetchStartedAt = Date.now();
     const startTime = Date.now();
 
-    // v3.4 FIX #3: Shared cancellation flag
+    // v3.5: Fresh cancel flag for this cycle, stored globally for watchdog access
     const cancelFlag = { cancelled: false };
+    globalCancelFlag = cancelFlag;
 
     console.log('\n' + '═'.repeat(60));
     console.log('🌐 FETCH CYCLE START');
@@ -499,22 +524,33 @@ async function fetchAllServersParallel() {
         const allResults = [];
         const halfPages = Math.ceil(CONFIG.PAGES_PER_PROXY / 2);
 
-        // v3.4 FIX #4: Sequential mode with 1 proxy
+        // v3.5: ALL modes wrapped in CYCLE_TIMEOUT via fetchWithTimeout
+
         if (PROXY_POOL.length === 1) {
             const proxy = PROXY_POOL[0];
             console.log(`   🔀 SEQUENTIAL MODE (1 proxy detected)`);
-            console.log(`   🚀 ${proxy.label} ↓Desc (${halfPages} pages)`);
-            
-            const descResult = await fetchChainWithProxy(proxy, halfPages, CONFIG.FETCH_PAGE_DELAY, 'Desc', cancelFlag);
-            allResults.push(descResult);
 
-            if (!cancelFlag.cancelled) {
-                // Fresh session for Asc stream
-                const proxyClone = { ...proxy, url: proxy.baseUrl, errors: 0 };
-                rotateOneProxy(proxyClone);
-                console.log(`   🚀 ${proxy.label} ↑Asc  (${halfPages} pages)`);
-                const ascResult = await fetchChainWithProxy(proxyClone, halfPages, CONFIG.FETCH_PAGE_DELAY, 'Asc', cancelFlag);
-                allResults.push(ascResult);
+            // v3.5 FIX #6: Sequential mode now has CYCLE_TIMEOUT
+            const seqResult = await fetchWithTimeout(async () => {
+                const results = [];
+
+                console.log(`   🚀 ${proxy.label} ↓Desc (${halfPages} pages)`);
+                const descResult = await fetchChainWithProxy(proxy, halfPages, CONFIG.FETCH_PAGE_DELAY, 'Desc', cancelFlag);
+                results.push(descResult);
+
+                if (!cancelFlag.cancelled) {
+                    // Fresh session for Asc
+                    rotateOneProxy(proxy);
+                    console.log(`   🚀 ${proxy.label} ↑Asc  (${halfPages} pages)`);
+                    const ascResult = await fetchChainWithProxy(proxy, halfPages, CONFIG.FETCH_PAGE_DELAY, 'Asc', cancelFlag);
+                    results.push(ascResult);
+                }
+
+                return results;
+            }, cancelFlag);
+
+            if (seqResult) {
+                allResults.push(...seqResult);
             }
 
         } else if (PROXY_POOL.length > 1) {
@@ -533,44 +569,36 @@ async function fetchAllServersParallel() {
 
             console.log(`   ⏳ ${promises.length} streams running in parallel...\n`);
 
-            // v3.4 FIX #2: Proper timeout with cleanup
-            let cycleTimer;
-            const timeoutPromise = new Promise((_, reject) => {
-                cycleTimer = setTimeout(() => reject(new Error('CYCLE_TIMEOUT')), CONFIG.CYCLE_TIMEOUT);
-            });
+            const parResult = await fetchWithTimeout(async () => {
+                return await Promise.allSettled(promises);
+            }, cancelFlag);
 
-            try {
-                const settled = await Promise.race([
-                    Promise.allSettled(promises),
-                    timeoutPromise
-                ]);
-                clearTimeout(cycleTimer);
-                
-                for (const r of settled) {
+            if (parResult) {
+                for (const r of parResult) {
                     if (r.status === 'fulfilled') {
                         allResults.push(r.value);
                     } else {
                         console.error(`   ❌ Stream failed: ${r.reason?.message}`);
                     }
                 }
-            } catch (e) {
-                clearTimeout(cycleTimer);
-                console.error(`   🚨 ${e.message}: killing all streams after ${CONFIG.CYCLE_TIMEOUT/1000}s`);
-                cancelFlag.cancelled = true;
-                stats.total_cycle_timeouts++;
-                await sleep(2000); // Let streams notice the cancel
             }
 
         } else {
             // No proxies: direct fetch
-            console.log(`   🚀 DIRECT ↓Desc (${CONFIG.DIRECT_PAGES} pages)`);
-            const descResult = await fetchChainWithProxy(null, CONFIG.DIRECT_PAGES, CONFIG.DIRECT_PAGE_DELAY, 'Desc', cancelFlag);
-            allResults.push(descResult);
-            
-            if (!cancelFlag.cancelled) {
-                console.log(`   🚀 DIRECT ↑Asc  (${CONFIG.DIRECT_PAGES} pages)`);
-                const ascResult = await fetchChainWithProxy(null, CONFIG.DIRECT_PAGES, CONFIG.DIRECT_PAGE_DELAY, 'Asc', cancelFlag);
-                allResults.push(ascResult);
+            const directResult = await fetchWithTimeout(async () => {
+                const results = [];
+                console.log(`   🚀 DIRECT ↓Desc (${CONFIG.DIRECT_PAGES} pages)`);
+                results.push(await fetchChainWithProxy(null, CONFIG.DIRECT_PAGES, CONFIG.DIRECT_PAGE_DELAY, 'Desc', cancelFlag));
+                
+                if (!cancelFlag.cancelled) {
+                    console.log(`   🚀 DIRECT ↑Asc  (${CONFIG.DIRECT_PAGES} pages)`);
+                    results.push(await fetchChainWithProxy(null, CONFIG.DIRECT_PAGES, CONFIG.DIRECT_PAGE_DELAY, 'Asc', cancelFlag));
+                }
+                return results;
+            }, cancelFlag);
+
+            if (directResult) {
+                allResults.push(...directResult);
             }
         }
 
@@ -864,7 +892,7 @@ app.get('/api/v1/stats', (req, res) => {
 
     res.json({
         game: STEAL_A_BRAINROT,
-        version: '3.4',
+        version: '3.5',
         cache: {
             total: globalCache.jobs.length,
             available: avail,
@@ -911,12 +939,13 @@ app.get('/api/v1/stats', (req, res) => {
 
 app.get('/health', (req, res) => {
     res.json({
-        status: 'ok', version: '3.4',
+        status: 'ok', version: '3.5',
         servers: globalCache.jobs.length,
         uptime: Math.floor(process.uptime()),
         collisions_ever: stats.total_collisions_detected,
         cycle_timeouts: stats.total_cycle_timeouts,
         watchdog_resets: stats.total_watchdog_resets,
+        stream_cancels: stats.total_stream_cancels,
         memory_mb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024)
     });
 });
@@ -963,14 +992,14 @@ setInterval(() => {
 }, 1800000);
 
 // =====================================================
-// 🚀 STARTUP — v3.4: setInterval BEFORE initial fetch
+// 🚀 STARTUP — v3.5
 // =====================================================
 
 app.listen(PORT, () => {
     console.clear();
     console.log('\n' + '═'.repeat(60));
-    console.log('🧠 STEAL A BRAINROT SCANNER - BACKEND v3.4');
-    console.log('   🔒 ZERO COLLISION + ANTI-HANG');
+    console.log('🧠 STEAL A BRAINROT SCANNER - BACKEND v3.5');
+    console.log('   🔒 ZERO COLLISION + ANTI-HANG + TIMEOUT FIX');
     console.log('═'.repeat(60));
     console.log(`🎮 ${STEAL_A_BRAINROT.GAME_NAME}`);
     console.log(`📍 Place ID: ${STEAL_A_BRAINROT.PLACE_ID}`);
@@ -986,13 +1015,13 @@ app.listen(PORT, () => {
     console.log('   Global lock + SHA-256 + history + safety net');
     console.log(`   Lock cost: ${Math.ceil(totalBots / 5)}ms/s (${((totalBots / 5) / 10).toFixed(1)}% CPU)`);
 
-    console.log('\n🛡️ ANTI-HANG (v3.4):');
+    console.log('\n🛡️ ANTI-HANG (v3.5):');
     console.log(`   1. setInterval BEFORE initial fetch`);
-    console.log(`   2. CYCLE_TIMEOUT: ${CONFIG.CYCLE_TIMEOUT/1000}s (timer cleaned up)`);
+    console.log(`   2. CYCLE_TIMEOUT: ${CONFIG.CYCLE_TIMEOUT/1000}s (ALL modes — sequential + parallel)`);
     console.log(`   3. Stream cancellation (instant stop on timeout)`);
     console.log(`   4. Sequential mode with 1 proxy`);
     console.log(`   5. Max ${CONFIG.MAX_ROTATIONS} rotations, no reset after ${CONFIG.ROTATION_NORESET_AFTER}`);
-    console.log(`   6. Watchdog: ${CONFIG.WATCHDOG_TIMEOUT/1000}s force reset`);
+    console.log(`   6. Watchdog: ${CONFIG.WATCHDOG_TIMEOUT/1000}s (kills stuck streams via cancelFlag)`);
 
     console.log('\n⚡ FETCH:');
     console.log(`   🌐 ${PROXY_POOL.length || 1} proxies × 2 sort orders (Desc+Asc)`);
@@ -1010,12 +1039,11 @@ app.listen(PORT, () => {
     console.log('═'.repeat(60) + '\n');
 
     // v3.4 FIX #1: Start interval BEFORE initial fetch
-    // Ensures watchdog works even if initial fetch hangs
     setInterval(fetchAllServersParallel, CONFIG.CACHE_REFRESH_INTERVAL);
 
     console.log('🔄 Initial fetch...\n');
     fetchAllServersParallel().then(() => {
-        console.log('✅ Backend v3.4 ready!\n');
+        console.log('✅ Backend v3.5 ready!\n');
     }).catch(e => {
         console.error('❌ Initial fetch failed:', e.message);
     });
