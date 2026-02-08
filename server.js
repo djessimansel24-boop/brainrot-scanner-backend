@@ -1,8 +1,13 @@
 // =====================================================
-// 🧠 STEAL A BRAINROT SCANNER - BACKEND v3.7
+// 🧠 STEAL A BRAINROT SCANNER - BACKEND v3.8
 // =====================================================
 //
-// v3.7 — CONTINUOUS FETCH + PROXY ROTATION + FAST COOLDOWN
+// v3.8 — ZERO DUPLICATE + SMART BATCH
+//
+// CHANGES vs v3.7:
+//   🔒 /claim-server endpoint: prevents 2 bots scanning same server
+//   ⚡ SERVERS_PER_BOT: 20 → 3 (bot only uses 1 per cycle, 2 fallback)
+//   📊 Pool math fixed: 750×2 = 1,500 wasted (was 750×19 = 14,250!)
 //
 // CHANGES vs v3.5:
 //   ⚡ Cooldown: 300s → 60s (servers recycle 5× faster)
@@ -129,7 +134,7 @@ const CONFIG = {
     ASSIGNMENT_DURATION: 120000,
     COOLDOWN_DURATION: 60000,          // v3.7: 2min → 1min (servers recyclent encore plus vite)
     AUTO_COOLDOWN_ON_EXPIRE: 60000,    // v3.7: cohérent avec COOLDOWN_DURATION
-    SERVERS_PER_BOT: 20,
+    SERVERS_PER_BOT: 3,               // v3.8: was 20, bot only uses 1 per cycle (2 fallback for failed teleport)
 
     // ── Fetch ──
     INITIAL_PAGES_PER_PROXY: 80,      // Initial big fetch: 40 per sort (deep scan)
@@ -306,6 +311,15 @@ const stats = {
 
 function blacklistServer(id, reason = 'unknown') {
     serverBlacklist.set(id, { reason, expires_at: Date.now() + CONFIG.BLACKLIST_DURATION });
+    
+    // Remove dead servers from cache entirely (they won't come back)
+    if (['restricted', 'not_found', 'timeout'].includes(reason)) {
+        const before = globalCache.jobs.length;
+        globalCache.jobs = globalCache.jobs.filter(j => j.id !== id);
+        if (globalCache.jobs.length < before) {
+            console.log(`   🗑️ Removed dead server ${id.slice(0,8)} (${reason}) → Cache: ${globalCache.jobs.length}`);
+        }
+    }
 }
 
 function isBlacklisted(id) {
@@ -616,7 +630,7 @@ async function initialBigFetch() {
 async function startContinuousFetching() {
     // Phase 1: Big initial fetch
     await initialBigFetch();
-    console.log('✅ Backend v3.7 ready!\n');
+    console.log('✅ Backend v3.8 ready!\n');
 
     // Phase 2: Start independent continuous loops (staggered start)
     console.log('🔄 Starting continuous fetch loops...\n');
@@ -803,6 +817,29 @@ app.get('/api/v1/get-job-assignment', verifyApiKey, async (req, res) => {
     } catch (e) { console.error('❌', e); res.status(500).json({ error: 'Internal error' }); }
 });
 
+// v3.8: Claim server — prevents 2 bots scanning the same spawn server
+app.post('/api/v1/claim-server', verifyApiKey, async (req, res) => {
+    const { bot_id, job_id } = req.body;
+    if (!bot_id || !job_id) return res.status(400).json({ error: 'Missing: bot_id, job_id' });
+
+    await globalAssignmentLock.acquire();
+    try {
+        const existing = serverAssignments.get(job_id);
+        if (existing && existing.bot_id !== bot_id && Date.now() < existing.expires_at) {
+            // Another bot already claimed this server
+            console.log(`🔒 ${bot_id}: server ${job_id.substring(0,8)}… already claimed by ${existing.bot_id}`);
+            return res.json({ success: true, scan: false, claimed_by: existing.bot_id });
+        }
+
+        // Claim it for this bot
+        assignServer(job_id, bot_id);
+        console.log(`✅ ${bot_id}: claimed spawn server ${job_id.substring(0,8)}…`);
+        return res.json({ success: true, scan: true });
+    } finally {
+        globalAssignmentLock.release();
+    }
+});
+
 app.post('/api/v1/release-server', verifyApiKey, (req, res) => {
     const { bot_id, job_id, reason } = req.body;
     if (!bot_id || !job_id) return res.status(400).json({ error: 'Missing: bot_id, job_id' });
@@ -847,7 +884,7 @@ app.get('/api/v1/stats', (req, res) => {
 
     res.json({
         game: STEAL_A_BRAINROT,
-        version: '3.7',
+        version: '3.8',
         cache: {
             total: globalCache.jobs.length,
             available: avail,
@@ -894,7 +931,7 @@ app.get('/api/v1/stats', (req, res) => {
 
 app.get('/health', (req, res) => {
     res.json({
-        status: 'ok', version: '3.7',
+        status: 'ok', version: '3.8',
         servers: globalCache.jobs.length,
         uptime: Math.floor(process.uptime()),
         collisions_ever: stats.total_collisions_detected,
@@ -947,13 +984,13 @@ setInterval(() => {
 }, 1800000);
 
 // =====================================================
-// 🚀 STARTUP — v3.7
+// 🚀 STARTUP — v3.8
 // =====================================================
 
 app.listen(PORT, () => {
     console.clear();
     console.log('\n' + '═'.repeat(60));
-    console.log('🧠 STEAL A BRAINROT SCANNER - BACKEND v3.7');
+    console.log('🧠 STEAL A BRAINROT SCANNER - BACKEND v3.8');
     console.log('   🔒 ZERO COLLISION + CONTINUOUS FETCH + FAST COOLDOWN');
     console.log('═'.repeat(60));
     console.log(`🎮 ${STEAL_A_BRAINROT.GAME_NAME}`);
@@ -970,7 +1007,7 @@ app.listen(PORT, () => {
     console.log('   Global lock + SHA-256 + history + safety net');
     console.log(`   Lock cost: ${Math.ceil(totalBots / 5)}ms/s (${((totalBots / 5) / 10).toFixed(1)}% CPU)`);
 
-    console.log('\n🛡️ SAFETY (v3.7):');
+    console.log('\n🛡️ SAFETY (v3.8):');
     console.log(`   1. Continuous fetch loop (never hangs)`);
     console.log(`   2. Max ${CONFIG.MAX_ROTATIONS} rotations per fetch`);
     console.log(`   3. ${CONFIG.FETCH_MAX_CONSECUTIVE_ERRORS} max consecutive errors → skip`);
