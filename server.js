@@ -5,7 +5,7 @@
 // v3.9 — ZERO DUPLICATE + INSTANT COOLDOWN
 //
 // CHANGES vs v3.8:
-//   ⚡ COOLDOWN_DURATION: 60s → 90s (pool math safe for 750 bots)
+//   ⚡ COOLDOWN_DURATION: 60s → 240s (4min, no server re-scanned)
 //   ⚡ Cooldown starts at ASSIGNMENT (no release needed from bot)
 //   ⚡ ASSIGNMENT_DURATION: 120s → 45s (crash safety only)
 //   🔒 reportedServers: prevents duplicate Discord webhooks
@@ -135,8 +135,8 @@ function rotateProxySessions() {
 const CONFIG = {
     // ── Assignation ──
     ASSIGNMENT_DURATION: 45000,            // v3.9: crash safety net only (bot never releases, cooldown handles it)
-    COOLDOWN_DURATION: 90000,              // v3.9: 60s→90s (pool math: 68/s × 90s = 6,120 + 750 = 6,870 < 10,000)
-    AUTO_COOLDOWN_ON_EXPIRE: 90000,        // v3.9: match cooldown
+    COOLDOWN_DURATION: 240000,             // v3.9: 240s (4min) — no server re-scanned until pool cycles
+    AUTO_COOLDOWN_ON_EXPIRE: 240000,       // v3.9: match cooldown
     SERVERS_PER_BOT: 3,                    // v3.9: 3 servers (1 target + 2 fallback if full)
 
     // ── Fetch ──
