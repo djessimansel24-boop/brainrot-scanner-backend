@@ -1,13 +1,16 @@
 // =====================================================
-// 🧠 STEAL A BRAINROT SCANNER - BACKEND v3.8
+// 🧠 STEAL A BRAINROT SCANNER - BACKEND v3.9 FINAL
 // =====================================================
 //
-// v3.8 — ZERO DUPLICATE + SMART BATCH
+// v3.9 — ZERO DUPLICATE + INSTANT COOLDOWN
 //
-// CHANGES vs v3.7:
-//   🔒 /claim-server endpoint: prevents 2 bots scanning same server
-//   ⚡ SERVERS_PER_BOT: 20 → 3 (bot only uses 1 per cycle, 2 fallback)
-//   📊 Pool math fixed: 750×2 = 1,500 wasted (was 750×19 = 14,250!)
+// CHANGES vs v3.8:
+//   ⚡ COOLDOWN_DURATION: 60s → 90s (pool math safe for 750 bots)
+//   ⚡ Cooldown starts at ASSIGNMENT (no release needed from bot)
+//   ⚡ ASSIGNMENT_DURATION: 120s → 45s (crash safety only)
+//   🔒 reportedServers: prevents duplicate Discord webhooks
+//   🔒 /report-found endpoint: scanner asks before sending
+//   🌐 PROXY_1 to PROXY_20 support (was 10)
 //
 // CHANGES vs v3.5:
 //   ⚡ Cooldown: 300s → 60s (servers recycle 5× faster)
@@ -81,9 +84,9 @@ function initProxyPool() {
         }
     }
 
-    // Numbered proxies: PROXY_1, PROXY_2, ... PROXY_10
-    // Use these when you have multiple proxies on the same provider
-    for (let i = 1; i <= 10; i++) {
+    // Numbered proxies: PROXY_1, PROXY_2, ... PROXY_20
+    // v3.9: extended from 10 to 20 proxies
+    for (let i = 1; i <= 20; i++) {
         const url = process.env[`PROXY_${i}`];
         if (url) {
             PROXY_POOL.push({ baseUrl: url, url, label: `P${i}`, errors: 0, lastError: 0, lastFetch: {} });
@@ -131,10 +134,10 @@ function rotateProxySessions() {
 
 const CONFIG = {
     // ── Assignation ──
-    ASSIGNMENT_DURATION: 120000,
-    COOLDOWN_DURATION: 60000,          // v3.7: 2min → 1min (servers recyclent encore plus vite)
-    AUTO_COOLDOWN_ON_EXPIRE: 60000,    // v3.7: cohérent avec COOLDOWN_DURATION
-    SERVERS_PER_BOT: 3,               // v3.8: was 20, bot only uses 1 per cycle (2 fallback for failed teleport)
+    ASSIGNMENT_DURATION: 45000,            // v3.9: crash safety net only (bot never releases, cooldown handles it)
+    COOLDOWN_DURATION: 90000,              // v3.9: 60s→90s (pool math: 68/s × 90s = 6,120 + 750 = 6,870 < 10,000)
+    AUTO_COOLDOWN_ON_EXPIRE: 90000,        // v3.9: match cooldown
+    SERVERS_PER_BOT: 3,                    // v3.9: 3 servers (1 target + 2 fallback if full)
 
     // ── Fetch ──
     INITIAL_PAGES_PER_PROXY: 80,      // Initial big fetch: 40 per sort (deep scan)
@@ -285,6 +288,8 @@ let proxyRotationIndex = 0;
 const serverAssignments = new Map();
 const serverCooldowns = new Map();
 const serverBlacklist = new Map();
+const reportedServers = new Map();   // v3.9: jobId → { bot_id, reported_at } — prevents duplicate Discord
+const REPORT_DEDUP_DURATION = 300000; // 5 minutes — same server won't trigger Discord twice
 const botHistory = new Map();
 const botLastRequest = new Map();
 
@@ -353,11 +358,15 @@ function isServerAvailable(id) {
 }
 
 function assignServer(id, botId) {
+    // v3.9: Cooldown starts IMMEDIATELY — no need for bot to release
+    // Assignment tracked for claim-server dedup only
     serverAssignments.set(id, {
         bot_id: botId,
         assigned_at: Date.now(),
         expires_at: Date.now() + CONFIG.ASSIGNMENT_DURATION
     });
+    // v3.9: Server goes in cooldown NOW, not when bot releases
+    serverCooldowns.set(id, Date.now() + CONFIG.COOLDOWN_DURATION);
 }
 
 function releaseServer(id, botId) {
@@ -630,7 +639,7 @@ async function initialBigFetch() {
 async function startContinuousFetching() {
     // Phase 1: Big initial fetch
     await initialBigFetch();
-    console.log('✅ Backend v3.8 ready!\n');
+    console.log('✅ Backend v3.9 FINAL ready!\n');
 
     // Phase 2: Start independent continuous loops (staggered start)
     console.log('🔄 Starting continuous fetch loops...\n');
@@ -817,7 +826,29 @@ app.get('/api/v1/get-job-assignment', verifyApiKey, async (req, res) => {
     } catch (e) { console.error('❌', e); res.status(500).json({ error: 'Internal error' }); }
 });
 
-// v3.8: Claim server — prevents 2 bots scanning the same spawn server
+// v3.9: Report-found dedup — prevents duplicate Discord webhooks
+// Scanner calls this BEFORE sending Discord. If another bot already
+// reported this server in the last 5 min → already_reported: true → skip Discord
+app.post('/api/v1/report-found', verifyApiKey, (req, res) => {
+    const { bot_id, job_id } = req.body;
+    if (!bot_id || !job_id) return res.status(400).json({ error: 'Missing: bot_id, job_id' });
+
+    const existing = reportedServers.get(job_id);
+    const now = Date.now();
+
+    if (existing && (now - existing.reported_at) < REPORT_DEDUP_DURATION) {
+        // Already reported by another bot recently
+        console.log(`🔒 ${bot_id}: server ${job_id.substring(0,8)}… already reported by ${existing.bot_id} ${Math.floor((now - existing.reported_at)/1000)}s ago`);
+        return res.json({ success: true, already_reported: true, reported_by: existing.bot_id });
+    }
+
+    // First report — register it
+    reportedServers.set(job_id, { bot_id, reported_at: now });
+    console.log(`📢 ${bot_id}: reported server ${job_id.substring(0,8)}… (first report)`);
+    return res.json({ success: true, already_reported: false });
+});
+
+// v3.9: Claim server — prevents 2 bots scanning the same spawn server
 app.post('/api/v1/claim-server', verifyApiKey, async (req, res) => {
     const { bot_id, job_id } = req.body;
     if (!bot_id || !job_id) return res.status(400).json({ error: 'Missing: bot_id, job_id' });
@@ -891,6 +922,7 @@ app.get('/api/v1/stats', (req, res) => {
             assigned: serverAssignments.size,
             cooldowns: serverCooldowns.size,
             blacklisted: serverBlacklist.size,
+            reported_dedup: reportedServers.size,
             age_s: globalCache.lastUpdate ? Math.floor((Date.now() - globalCache.lastUpdate) / 1000) : -1,
             fetching: globalCache.fetchInProgress,
             fetch_running_s: globalCache.fetchInProgress ? Math.floor((Date.now() - globalCache.fetchStartedAt) / 1000) : 0,
@@ -966,8 +998,13 @@ setInterval(() => {
     for (const [id, ts] of botLastRequest.entries()) {
         if (now - ts > 60000) botLastRequest.delete(id);
     }
+    // v3.9: Clean expired report dedup entries
+    let cR = 0;
+    for (const [id, r] of reportedServers.entries()) {
+        if (now - r.reported_at > REPORT_DEDUP_DURATION) { reportedServers.delete(id); cR++; }
+    }
 
-    if (cA + cC + cB > 0) console.log(`🧹 ${cA} assign→cd, ${cC} cd expired, ${cB} bl expired`);
+    if (cA + cC + cB + cR > 0) console.log(`🧹 ${cA} assign→cd, ${cC} cd expired, ${cB} bl expired${cR > 0 ? `, ${cR} reports expired` : ''}`);
 }, CONFIG.CLEANUP_INTERVAL);
 
 setInterval(() => {
@@ -984,14 +1021,14 @@ setInterval(() => {
 }, 1800000);
 
 // =====================================================
-// 🚀 STARTUP — v3.8
+// 🚀 STARTUP — v3.9
 // =====================================================
 
 app.listen(PORT, () => {
     console.clear();
     console.log('\n' + '═'.repeat(60));
-    console.log('🧠 STEAL A BRAINROT SCANNER - BACKEND v3.8');
-    console.log('   🔒 ZERO COLLISION + CONTINUOUS FETCH + FAST COOLDOWN');
+    console.log('🧠 STEAL A BRAINROT SCANNER - BACKEND v3.9 FINAL');
+    console.log('   ⚡ INSTANT COOLDOWN + ZERO DUPLICATE + 20 PROXIES');
     console.log('═'.repeat(60));
     console.log(`🎮 ${STEAL_A_BRAINROT.GAME_NAME}`);
     console.log(`📍 Place ID: ${STEAL_A_BRAINROT.PLACE_ID}`);
@@ -1007,17 +1044,16 @@ app.listen(PORT, () => {
     console.log('   Global lock + SHA-256 + history + safety net');
     console.log(`   Lock cost: ${Math.ceil(totalBots / 5)}ms/s (${((totalBots / 5) / 10).toFixed(1)}% CPU)`);
 
-    console.log('\n🛡️ SAFETY (v3.8):');
-    console.log(`   1. Continuous fetch loop (never hangs)`);
-    console.log(`   2. Max ${CONFIG.MAX_ROTATIONS} rotations per fetch`);
-    console.log(`   3. ${CONFIG.FETCH_MAX_CONSECUTIVE_ERRORS} max consecutive errors → skip`);
-    console.log(`   4. Stale purge every 10 cycles`);
+    console.log('\n⚡ v3.9 COOLDOWN:');
+    console.log(`   Cooldown starts at ASSIGNMENT (bot never releases)`);
+    console.log(`   ${CONFIG.COOLDOWN_DURATION / 1000}s cooldown — ${totalBots} bots × ${Math.ceil(11)} s/scan = ${Math.ceil(totalBots / 11)}/s consumed`);
+    console.log(`   Max in cooldown: ~${Math.ceil((totalBots / 11) * CONFIG.COOLDOWN_DURATION / 1000)} servers`);
+    console.log(`   Report-dedup: ${REPORT_DEDUP_DURATION / 1000}s (no duplicate Discord)`);
 
     console.log('\n⚡ FETCH:');
     console.log(`   🌐 ${PROXY_POOL.length} proxies — ALL running continuously`);
-    console.log(`   🚀 Phase 1: Big initial fetch — ${CONFIG.INITIAL_PAGES_PER_PROXY} pages/proxy (${Math.ceil(CONFIG.INITIAL_PAGES_PER_PROXY/2)} per sort)`);
-    console.log(`   🔁 Phase 2: ${PROXY_POOL.length} continuous loops — ${CONFIG.CONTINUOUS_PAGES_PER_PROXY} pages/fetch (${Math.ceil(CONFIG.CONTINUOUS_PAGES_PER_PROXY/2)} per sort, ${CONFIG.CONTINUOUS_FETCH_DELAY / 1000}s gap)`);
-    console.log(`   🗑️ Stale after ${CONFIG.STALE_THRESHOLD / 60000} min`);
+    console.log(`   🚀 Phase 1: Big initial fetch — ${CONFIG.INITIAL_PAGES_PER_PROXY} pages/proxy`);
+    console.log(`   🔁 Phase 2: Continuous loops — ${CONFIG.CONTINUOUS_PAGES_PER_PROXY} pages/fetch, ${CONFIG.CONTINUOUS_FETCH_DELAY / 1000}s gap`);
 
     console.log('\n📊 CAPACITY:');
     console.log(`   🤖 ${totalBots} bots × ${CONFIG.SERVERS_PER_BOT} = ${(totalBots * CONFIG.SERVERS_PER_BOT).toLocaleString()} servers/cycle`);
