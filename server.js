@@ -7,7 +7,7 @@
 // ARCHITECTURE:
 //   📡 Continuous fetch: all proxies run independent loops
 //   🔒 Zero collision: global lock + SHA-256 + history
-//   ⚡ Cooldown at assignment: bot never releases, server locked 240s
+//   ⚡ Cooldown at assignment: bot never releases, server locked 90s
 //   🔒 Report-found dedup: prevents duplicate Discord webhooks
 //
 // ENDPOINTS:
