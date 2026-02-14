@@ -125,8 +125,8 @@ function rotateProxySessions() {
 
 const CONFIG = {
     // ── Assignation ──
-    ASSIGNMENT_DURATION: 15000,            // Safety net: if bot crashes, assignment expires in 15s
-    COOLDOWN_DURATION: "30000,             // 30s (30sec) — server not re-assigned for 30sec
+    ASSIGNMENT_DURATION: 30000,            // Safety net: if bot crashes, assignment expires in 15s
+    COOLDOWN_DURATION: 30000,             // 30s (30sec) — server not re-assigned for 30sec
     AUTO_COOLDOWN_ON_EXPIRE: 30000,       // Same duration if assignment expires (bot crash)
     SERVERS_PER_BOT: 3,                    // 1 target + 2 fallback if full
 
