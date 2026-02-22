@@ -3,25 +3,16 @@
 // =====================================================
 //
 // Matches SCANNER v9.0 — PERFECT SCAN + INSTANT HOP
-//
-// ARCHITECTURE:
-//   📡 Continuous fetch: all proxies run independent loops
-//   🔒 Zero collision: global lock + SHA-256 + history
-//   ⚡ Cooldown at assignment: bot never releases, server locked 90s
-//   🔒 Report-found dedup: prevents duplicate Discord webhooks
+// + 📊 REAL-TIME HOPS TRACKING + DISCORD STATS
 //
 // ENDPOINTS:
 //   POST /api/v1/get-job-assignment — assign servers to bot
-//   POST /api/v1/report-found — check if server already reported (Discord dedup)
+//   POST /api/v1/report-found — check if server already reported
 //   POST /api/v1/report-restricted — blacklist a dead server
 //   POST /api/v1/clear-history — reset a bot's history
+//   POST /scan-complete — bot reports real scan done (hops tracking)
 //   GET  /api/v1/stats — dashboard
 //   GET  /health — health check
-//
-// REMOVED (scanner v9 doesn't use):
-//   ❌ /claim-server — bot always scans, no claim needed
-//   ❌ /release-server — cooldown starts at assignment
-//   ❌ /release-batch — same reason
 //
 // =====================================================
 
@@ -61,7 +52,6 @@ const REGIONAL_CONFIG = {
 };
 
 function initProxyPool() {
-    // Named regional proxies (backward compat)
     const envMap = {
         'PROXY_US':            'US',
         'PROXY_EU':            'EU',
@@ -76,7 +66,6 @@ function initProxyPool() {
         }
     }
 
-    // Numbered proxies: PROXY_1 through PROXY_20
     for (let i = 1; i <= 20; i++) {
         const url = process.env[`PROXY_${i}`];
         if (url) {
@@ -124,39 +113,31 @@ function rotateProxySessions() {
 // =====================================================
 
 const CONFIG = {
-    // ── Assignation ──
-    ASSIGNMENT_DURATION: 45000,            // Safety net: if bot crashes, assignment expires in 45s
-    COOLDOWN_DURATION: 90000,             // 90s (1min30) — server not re-assigned for 1min30
-    AUTO_COOLDOWN_ON_EXPIRE: 90000,       // Same duration if assignment expires (bot crash)
-    SERVERS_PER_BOT: 3,                    // 1 target + 2 fallback if full
+    ASSIGNMENT_DURATION: 45000,
+    COOLDOWN_DURATION: 90000,
+    AUTO_COOLDOWN_ON_EXPIRE: 90000,
+    SERVERS_PER_BOT: 3,
 
-    // ── Fetch ──
-    INITIAL_PAGES_PER_PROXY: 80,           // Initial big fetch: 40 per sort direction
-    CONTINUOUS_PAGES_PER_PROXY: 20,        // Continuous loops: 10 per sort direction
+    INITIAL_PAGES_PER_PROXY: 80,
+    CONTINUOUS_PAGES_PER_PROXY: 20,
     FETCH_PAGE_DELAY: 1200,
     FETCH_PAGE_TIMEOUT: 12000,
     FETCH_MAX_CONSECUTIVE_ERRORS: 4,
     FETCH_RATE_LIMIT_BACKOFF: 5000,
-    CONTINUOUS_FETCH_DELAY: 10000,         // 10s between mini-fetches
-    STALE_THRESHOLD: 600000,               // Servers expire from cache after 10min
+    CONTINUOUS_FETCH_DELAY: 10000,
+    STALE_THRESHOLD: 600000,
 
-    // ── Direct fetch (no proxy) ──
     DIRECT_PAGES: 50,
     DIRECT_PAGE_DELAY: 1000,
 
-    // ── Bot management ──
     BOT_REQUEST_COOLDOWN: 5000,
     MAX_BOT_HISTORY: 2000,
 
-    // ── Blacklist ──
-    BLACKLIST_DURATION: 600000,            // 10min
+    BLACKLIST_DURATION: 600000,
+    CLEANUP_INTERVAL: 10000,
 
-    // ── Cleanup ──
-    CLEANUP_INTERVAL: 10000,               // 10s
-
-    // ── Anti-hang ──
-    CYCLE_TIMEOUT: 240000,                 // 4min max per fetch cycle
-    WATCHDOG_TIMEOUT: 300000,              // 5min
+    CYCLE_TIMEOUT: 240000,
+    WATCHDOG_TIMEOUT: 300000,
     MAX_ROTATIONS: 10,
     ROTATION_NORESET_AFTER: 7,
 };
@@ -273,13 +254,13 @@ const globalCache = {
 let globalCancelFlag = { cancelled: false };
 let proxyRotationIndex = 0;
 
-const serverAssignments = new Map();   // id → { bot_id, assigned_at, expires_at }
-const serverCooldowns = new Map();     // id → expires_at (timestamp)
-const serverBlacklist = new Map();     // id → { reason, expires_at }
-const reportedServers = new Map();     // jobId → { bot_id, reported_at }
-const REPORT_DEDUP_DURATION = 300000;  // 5min — same server won't trigger Discord twice
-const botHistory = new Map();          // bot_id → Set of server IDs
-const botLastRequest = new Map();      // bot_id → last request timestamp
+const serverAssignments = new Map();
+const serverCooldowns = new Map();
+const serverBlacklist = new Map();
+const reportedServers = new Map();
+const REPORT_DEDUP_DURATION = 300000;
+const botHistory = new Map();
+const botLastRequest = new Map();
 
 const stats = {
     total_requests: 0,
@@ -298,13 +279,85 @@ const stats = {
 };
 
 // =====================================================
+// 📊 REAL-TIME HOPS TRACKING + DISCORD STATS
+// =====================================================
+
+const DISCORD_STATS_WEBHOOK = 'https://discord.com/api/webhooks/1475134816230834258/iAixdVONKzqgyJ0P0nV-aqQW9-CTt3P-MOUs6U3n1WcoEASQ-sBZMPQfAvuhn2L7Kn-C';
+const scanTimestamps = [];
+let totalScans = 0;
+let discordMessageId = null;
+
+function getHopsPerMinute() {
+    const now = Date.now();
+    const oneMinAgo = now - 60000;
+    while (scanTimestamps.length > 0 && scanTimestamps[0] < oneMinAgo) {
+        scanTimestamps.shift();
+    }
+    return scanTimestamps.length;
+}
+
+function getHopsPerMinute5m() {
+    const now = Date.now();
+    const fiveMinAgo = now - 300000;
+    let count = 0;
+    for (let i = scanTimestamps.length - 1; i >= 0; i--) {
+        if (scanTimestamps[i] >= fiveMinAgo) count++;
+        else break;
+    }
+    return Math.round(count / 5);
+}
+
+async function updateDiscordStats() {
+    const hopsMin = getHopsPerMinute();
+    const hops5m = getHopsPerMinute5m();
+    const uptimeS = Math.floor((Date.now() - stats.uptime_start) / 1000);
+    const uptimeM = Math.floor(uptimeS / 60);
+    const uptimeH = Math.floor(uptimeM / 60);
+
+    const embed = {
+        title: '⚡ Scanner Stats — Real-Time',
+        color: 0x00FFB3,
+        fields: [
+            { name: '⚡ Combined Rate', value: `**${hopsMin}** hops/min`, inline: true },
+            { name: '📊 Avg (5min)', value: `**${hops5m}** hops/min`, inline: true },
+            { name: '✅ Total Scans', value: `**${totalScans.toLocaleString()}**`, inline: true },
+            { name: '⏱️ Uptime', value: `${uptimeH}h ${uptimeM % 60}m`, inline: true },
+        ],
+        footer: { text: `Updated • Backend v3.9` },
+    };
+
+    const payload = JSON.stringify({ username: 'Scanner Stats', embeds: [embed] });
+
+    try {
+        if (discordMessageId) {
+            const res = await fetch(`${DISCORD_STATS_WEBHOOK}/messages/${discordMessageId}`, {
+                method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: payload,
+            });
+            if (!res.ok) discordMessageId = null;
+        }
+        if (!discordMessageId) {
+            const res = await fetch(`${DISCORD_STATS_WEBHOOK}?wait=true`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: payload,
+            });
+            if (res.ok) {
+                const data = await res.json();
+                discordMessageId = data.id;
+            }
+        }
+    } catch (err) {
+        console.log(`⚠️ Discord stats error: ${err.message}`);
+    }
+}
+
+setInterval(updateDiscordStats, 30000);
+setTimeout(updateDiscordStats, 10000);
+
+// =====================================================
 // 🚫 BLACKLIST
 // =====================================================
 
 function blacklistServer(id, reason = 'unknown') {
     serverBlacklist.set(id, { reason, expires_at: Date.now() + CONFIG.BLACKLIST_DURATION });
-
-    // Remove dead servers from cache
     if (['restricted', 'not_found', 'timeout'].includes(reason)) {
         const before = globalCache.jobs.length;
         globalCache.jobs = globalCache.jobs.filter(j => j.id !== id);
@@ -327,34 +380,26 @@ function isBlacklisted(id) {
 
 function isServerAvailable(id) {
     if (isBlacklisted(id)) return false;
-
-    // Check assignment (short-term: "who has this right now?")
     const a = serverAssignments.get(id);
     if (a) {
         if (Date.now() < a.expires_at) return false;
-        // Assignment expired (bot crashed) → move to cooldown
         serverAssignments.delete(id);
         serverCooldowns.set(id, Date.now() + CONFIG.AUTO_COOLDOWN_ON_EXPIRE);
     }
-
-    // Check cooldown (long-term: "don't re-scan this server")
     const cd = serverCooldowns.get(id);
     if (cd) {
         if (Date.now() < cd) return false;
         serverCooldowns.delete(id);
     }
-
     return true;
 }
 
 function assignServer(id, botId) {
-    // Track assignment for collision detection
     serverAssignments.set(id, {
         bot_id: botId,
         assigned_at: Date.now(),
         expires_at: Date.now() + CONFIG.ASSIGNMENT_DURATION
     });
-    // Cooldown starts NOW — bot never needs to release
     serverCooldowns.set(id, Date.now() + CONFIG.COOLDOWN_DURATION);
 }
 
@@ -483,22 +528,18 @@ async function fetchChainWithProxy(proxy, maxPages, pageDelay, sortOrder, cancel
 
 function mergeIntoCache(newServers, label) {
     if (newServers.length === 0) return 0;
-
     const now = Date.now();
     const mergedMap = new Map();
-
     for (const s of globalCache.jobs) {
         if (now - s.fetched_at < CONFIG.STALE_THRESHOLD) {
             mergedMap.set(s.id, s);
         }
     }
-
     let newCount = 0;
     for (const s of newServers) {
         if (!mergedMap.has(s.id)) newCount++;
         mergedMap.set(s.id, s);
     }
-
     globalCache.jobs = Array.from(mergedMap.values());
     globalCache.lastUpdate = now;
     return newCount;
@@ -506,20 +547,16 @@ function mergeIntoCache(newServers, label) {
 
 async function proxyFetchLoop(proxy) {
     let cycleNum = 0;
-
     while (true) {
         cycleNum++;
         const sortOrder = cycleNum % 2 === 0 ? 'Asc' : 'Desc';
         const halfPages = Math.ceil(CONFIG.CONTINUOUS_PAGES_PER_PROXY / 2);
-
         rotateOneProxy(proxy);
         const cancelFlag = { cancelled: false };
         const startTime = Date.now();
-
         try {
             const result = await fetchChainWithProxy(proxy, halfPages, CONFIG.FETCH_PAGE_DELAY, sortOrder, cancelFlag);
             const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-
             if (result.servers.length > 0) {
                 const newCount = mergeIntoCache(result.servers, `${proxy.label}/${sortOrder}`);
                 console.log(`   ✅ [${proxy.label}/${sortOrder}] ${result.servers.length} fetched, +${newCount} new → Cache: ${globalCache.jobs.length} (${elapsed}s)`);
@@ -530,7 +567,6 @@ async function proxyFetchLoop(proxy) {
         } catch (e) {
             console.error(`   ❌ [${proxy.label}/${sortOrder}] Error: ${e.message}`);
         }
-
         await sleep(CONFIG.CONTINUOUS_FETCH_DELAY);
     }
 }
@@ -539,27 +575,21 @@ async function initialBigFetch() {
     console.log('═'.repeat(60));
     console.log('🚀 INITIAL BIG FETCH — all proxies in parallel');
     console.log('═'.repeat(60));
-
     const startTime = Date.now();
     const halfPages = Math.ceil(CONFIG.INITIAL_PAGES_PER_PROXY / 2);
     const promises = [];
-
     for (const proxy of PROXY_POOL) {
         rotateOneProxy(proxy);
         console.log(`   🚀 ${proxy.label} ↓Desc (${halfPages} pages)`);
         promises.push(fetchChainWithProxy(proxy, halfPages, CONFIG.FETCH_PAGE_DELAY, 'Desc', { cancelled: false }));
-
         const proxyClone = { ...proxy, url: proxy.baseUrl, errors: 0 };
         rotateOneProxy(proxyClone);
         console.log(`   🚀 ${proxy.label} ↑Asc  (${halfPages} pages)`);
         promises.push(fetchChainWithProxy(proxyClone, halfPages, CONFIG.FETCH_PAGE_DELAY, 'Asc', { cancelled: false }));
     }
-
     console.log(`   ⏳ ${promises.length} streams...\n`);
-
     const results = await Promise.allSettled(promises);
     let totalRaw = 0, totalNew = 0;
-
     for (const r of results) {
         if (r.status === 'fulfilled' && r.value.servers.length > 0) {
             const newCount = mergeIntoCache(r.value.servers, r.value.label);
@@ -568,7 +598,6 @@ async function initialBigFetch() {
             console.log(`   ✅ [${r.value.label}] ${r.value.servers.length} servers (${r.value.pages} pages)`);
         }
     }
-
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
     console.log('\n' + '═'.repeat(60));
     console.log(`✅ Initial fetch: ${totalRaw} raw → ${totalNew} unique → Cache: ${globalCache.jobs.length} (${elapsed}s)`);
@@ -578,7 +607,6 @@ async function initialBigFetch() {
 async function startContinuousFetching() {
     await initialBigFetch();
     console.log('✅ Backend v3.9 ready!\n');
-
     console.log('🔄 Starting continuous fetch loops...\n');
     for (let i = 0; i < PROXY_POOL.length; i++) {
         const proxy = PROXY_POOL[i];
@@ -590,7 +618,6 @@ async function startContinuousFetching() {
         }, i * 2000);
     }
 
-    // Stale purge every 60s
     setInterval(() => {
         const now = Date.now();
         const before = globalCache.jobs.length;
@@ -617,7 +644,6 @@ function verifyApiKey(req, res, next) {
 // =====================================================
 
 async function handleJobAssignment(bot_id, vps_id, res) {
-    // Determine bot's region from VPS ID
     let botRegion = null;
     for (const [region, config] of Object.entries(REGIONAL_CONFIG)) {
         if (vps_id >= config.vps_range[0] && vps_id <= config.vps_range[1]) {
@@ -627,21 +653,17 @@ async function handleJobAssignment(bot_id, vps_id, res) {
     }
     if (!botRegion) return res.status(400).json({ error: `Invalid VPS ID: ${vps_id}` });
 
-    // Rate limit
     const rl = checkBotRateLimit(bot_id);
     if (!rl.allowed) {
         stats.total_rate_limited++;
         return res.status(429).json({ error: 'Too fast', retry_in_ms: rl.wait_ms });
     }
 
-    // Cache empty?
     if (globalCache.jobs.length === 0) {
         return res.status(503).json({ error: 'Cache empty', retry_in: 10 });
     }
 
-    // Lock — one assignment at a time to prevent collisions
     await globalAssignmentLock.acquire();
-
     if (globalAssignmentLock.queueLength > stats.lock_max_queue) {
         stats.lock_max_queue = globalAssignmentLock.queueLength;
     }
@@ -649,19 +671,16 @@ async function handleJobAssignment(bot_id, vps_id, res) {
     try {
         let skipBL = 0, skipAssign = 0, skipHist = 0;
         const available = [];
-
         for (const job of globalCache.jobs) {
             if (isBlacklisted(job.id)) { skipBL++; continue; }
             if (!isServerAvailable(job.id)) { skipAssign++; continue; }
             if (botAlreadyScanned(bot_id, job.id)) { skipHist++; continue; }
             available.push(job);
         }
-
         stats.total_blacklist_filtered += skipBL;
         stats.total_duplicates_skipped += skipHist;
 
         if (available.length === 0) {
-            // Try clearing bot history
             const h = botHistory.get(bot_id);
             if (h && h.size > 0) {
                 console.log(`🔄 ${bot_id}: History full (${h.size}), resetting`);
@@ -678,21 +697,18 @@ async function handleJobAssignment(bot_id, vps_id, res) {
         }
 
         return doAssign(available, bot_id, botRegion, res);
-
     } finally {
         globalAssignmentLock.release();
     }
 }
 
 function doAssign(available, bot_id, botRegion, res) {
-    // SHA-256 deterministic sort — each bot gets a different "view" of the pool
     const sorted = available
         .map(j => ({ ...j, _h: deterministicHashNum(j.id, bot_id) }))
         .sort((a, b) => a._h - b._h);
 
     const count = Math.min(CONFIG.SERVERS_PER_BOT, sorted.length);
     const candidates = sorted.slice(0, count);
-
     const finalIds = [];
     let collisionsDetected = 0;
 
@@ -707,7 +723,6 @@ function doAssign(available, bot_id, botRegion, res) {
         finalIds.push(job.id);
     }
 
-    // Replace collided servers with next available
     if (collisionsDetected > 0 && sorted.length > count) {
         const extra = sorted.slice(count, count + collisionsDetected);
         for (const job of extra) {
@@ -720,7 +735,6 @@ function doAssign(available, bot_id, botRegion, res) {
         }
     }
 
-    // Assign + cooldown starts NOW
     for (const id of finalIds) {
         assignServer(id, bot_id);
     }
@@ -751,7 +765,6 @@ function doAssign(available, bot_id, botRegion, res) {
 // 🎯 ENDPOINTS
 // =====================================================
 
-// ── Main: assign servers to bot ──
 app.post('/api/v1/get-job-assignment', verifyApiKey, async (req, res) => {
     try {
         stats.total_requests++;
@@ -770,25 +783,20 @@ app.get('/api/v1/get-job-assignment', verifyApiKey, async (req, res) => {
     } catch (e) { console.error('❌', e); res.status(500).json({ error: 'Internal error' }); }
 });
 
-// ── Discord dedup: check if server already reported ──
 app.post('/api/v1/report-found', verifyApiKey, (req, res) => {
     const { bot_id, job_id } = req.body;
     if (!bot_id || !job_id) return res.status(400).json({ error: 'Missing: bot_id, job_id' });
-
     const existing = reportedServers.get(job_id);
     const now = Date.now();
-
     if (existing && (now - existing.reported_at) < REPORT_DEDUP_DURATION) {
         console.log(`🔒 ${bot_id}: server ${job_id.substring(0,8)}… already reported by ${existing.bot_id} ${Math.floor((now - existing.reported_at)/1000)}s ago`);
         return res.json({ success: true, already_reported: true, reported_by: existing.bot_id });
     }
-
     reportedServers.set(job_id, { bot_id, reported_at: now });
     console.log(`📢 ${bot_id}: reported server ${job_id.substring(0,8)}… (first report)`);
     return res.json({ success: true, already_reported: false });
 });
 
-// ── Blacklist dead servers ──
 app.post('/api/v1/report-restricted', verifyApiKey, (req, res) => {
     const { bot_id, job_id, reason } = req.body;
     if (!bot_id || !job_id) return res.status(400).json({ error: 'Missing: bot_id, job_id' });
@@ -796,7 +804,6 @@ app.post('/api/v1/report-restricted', verifyApiKey, (req, res) => {
     res.json({ success: true, total_blacklisted: serverBlacklist.size });
 });
 
-// ── Admin: clear bot history ──
 app.post('/api/v1/clear-history', verifyApiKey, (req, res) => {
     const { bot_id } = req.body;
     if (!bot_id) return res.status(400).json({ error: 'Missing: bot_id' });
@@ -806,10 +813,16 @@ app.post('/api/v1/clear-history', verifyApiKey, (req, res) => {
     res.json({ success: true, cleared: sz });
 });
 
-// ── Dashboard ──
+// ── 📊 Scan complete — bot confirms real hop done ──
+app.post('/scan-complete', (req, res) => {
+    const { bot_id, job_id } = req.body || {};
+    scanTimestamps.push(Date.now());
+    totalScans++;
+    res.json({ ok: true, hops_min: getHopsPerMinute(), total: totalScans });
+});
+
 app.get('/api/v1/stats', (req, res) => {
     const avail = globalCache.jobs.filter(j => isServerAvailable(j.id)).length;
-
     res.json({
         game: STEAL_A_BRAINROT,
         version: '3.9',
@@ -826,6 +839,11 @@ app.get('/api/v1/stats', (req, res) => {
             tracked: botHistory.size,
             ...stats,
             uptime_s: Math.floor((Date.now() - stats.uptime_start) / 1000)
+        },
+        hops: {
+            real_hops_per_min: getHopsPerMinute(),
+            real_hops_5m_avg: getHopsPerMinute5m(),
+            total_scans: totalScans,
         },
         lock: {
             queue_now: globalAssignmentLock.queueLength,
@@ -853,11 +871,12 @@ app.get('/api/v1/stats', (req, res) => {
     });
 });
 
-// ── Health check ──
 app.get('/health', (req, res) => {
     res.json({
         status: 'ok', version: '3.9',
         servers: globalCache.jobs.length,
+        hops_min: getHopsPerMinute(),
+        total_scans: totalScans,
         uptime: Math.floor(process.uptime()),
         collisions_ever: stats.total_collisions_detected,
         memory_mb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024)
@@ -871,8 +890,6 @@ app.get('/health', (req, res) => {
 setInterval(() => {
     const now = Date.now();
     let cA = 0, cC = 0, cB = 0, cR = 0;
-
-    // Expired assignments → move to cooldown
     for (const [id, a] of serverAssignments.entries()) {
         if (now > a.expires_at) {
             serverAssignments.delete(id);
@@ -880,33 +897,23 @@ setInterval(() => {
             cA++;
         }
     }
-
-    // Expired cooldowns → server available again
     for (const [id, exp] of serverCooldowns.entries()) {
         if (now > exp) { serverCooldowns.delete(id); cC++; }
     }
-
-    // Expired blacklist
     for (const [id, e] of serverBlacklist.entries()) {
         if (now > e.expires_at) { serverBlacklist.delete(id); cB++; }
     }
-
-    // Expired rate limits
     for (const [id, ts] of botLastRequest.entries()) {
         if (now - ts > 60000) botLastRequest.delete(id);
     }
-
-    // Expired report dedup
     for (const [id, r] of reportedServers.entries()) {
         if (now - r.reported_at > REPORT_DEDUP_DURATION) { reportedServers.delete(id); cR++; }
     }
-
     if (cA + cC + cB + cR > 0) {
         console.log(`🧹 ${cA} assign→cd, ${cC} cd expired, ${cB} bl expired${cR > 0 ? `, ${cR} reports expired` : ''}`);
     }
 }, CONFIG.CLEANUP_INTERVAL);
 
-// Bot history trim — every 30min
 setInterval(() => {
     let trimmed = 0;
     for (const [botId, h] of botHistory.entries()) {
@@ -929,6 +936,7 @@ app.listen(PORT, () => {
     console.log('\n' + '═'.repeat(60));
     console.log('🧠 STEAL A BRAINROT SCANNER - BACKEND v3.9');
     console.log('   ⚡ INSTANT COOLDOWN + ZERO COLLISION');
+    console.log('   📊 REAL-TIME HOPS TRACKING + DISCORD');
     console.log('═'.repeat(60));
     console.log(`🎮 ${STEAL_A_BRAINROT.GAME_NAME}`);
     console.log(`📍 Place ID: ${STEAL_A_BRAINROT.PLACE_ID}`);
@@ -951,6 +959,9 @@ app.listen(PORT, () => {
     console.log(`   🌐 ${PROXY_POOL.length} proxies — ALL running continuously`);
     console.log(`   🚀 Phase 1: Initial — ${CONFIG.INITIAL_PAGES_PER_PROXY} pages/proxy`);
     console.log(`   🔁 Phase 2: Continuous — ${CONFIG.CONTINUOUS_PAGES_PER_PROXY} pages, ${CONFIG.CONTINUOUS_FETCH_DELAY / 1000}s gap`);
+
+    console.log('\n📊 DISCORD STATS:');
+    console.log('   Updates every 30s — real hops/min from scan-complete');
 
     console.log('\n📊 CAPACITY:');
     console.log(`   🤖 ${totalBots} bots × ${CONFIG.SERVERS_PER_BOT} servers = ${(totalBots * CONFIG.SERVERS_PER_BOT).toLocaleString()}/cycle`);
